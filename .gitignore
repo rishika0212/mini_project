@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv/
+venv/
+
+# Editors and local tooling
+.vscode/
+.zencoder/
+.zenflow/
+
+# Generated project outputs
+data/snapshots/
+data/*.csv
+dataset/images/
+dataset/labels/
+runs/
+
+# Optional local model weights
+vehicle_detector.pt
+
+# OS
+.DS_Store
+Thumbs.db

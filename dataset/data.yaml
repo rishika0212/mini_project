@@ -1,0 +1,6 @@
+names:
+- vehicle
+nc: 1
+path: C:\CARLA\Traffic_project\dataset
+train: images/train
+val: images/val
