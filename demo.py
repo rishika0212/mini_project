@@ -297,31 +297,60 @@ _approach_spawn_candidates.sort(key=lambda sp: sp.location.distance(center),
                                 reverse=True)
 print(f"Approach arm spawn candidates (30-65 m, farthest first): {len(_approach_spawn_candidates)}")
 
-# ── Split intersection lights into two perpendicular groups ──────────────
-# group_A = lights whose axis aligns with the CAM 1 approach road (NS arm)
-# group_B = lights perpendicular to the approach road (EW arm)
-# Phase 0: A=Green, B=Red | Phase 1: A=Yellow, B=Red | Phase 2: A=Red, B=Green
+# ── Split intersection lights into two perpendicular groups (BALANCED) ────
+# Get ALL traffic lights within 100m of intersection center
+# Sort by X-Y distance difference and split at midpoint to ensure perfect balance
+# This avoids uneven splits like 3-1 that caused multiple lights green simultaneously
+all_traffic_lights = world.get_actors().filter("traffic.traffic_light")
+main_intersection_lights = []
+
+for light in all_traffic_lights:
+    dist = light.get_location().distance(center)
+    if dist < 100:  # 100m search radius
+        main_intersection_lights.append(light)
+
+print(f"Total traffic lights found within 100m: {len(main_intersection_lights)}")
+
+# Build light data: (index, light_object, dx, dy, dx-dy_diff)
+light_data = []
+for i, light in enumerate(main_intersection_lights):
+    loc = light.get_location()
+    dx = abs(loc.x - center.x)
+    dy = abs(loc.y - center.y)
+    diff = dx - dy
+    light_data.append((i, light, dx, dy, diff))
+    print(f"  Light {i}: pos=({loc.x:.1f}, {loc.y:.1f}), dx={dx:.1f}, dy={dy:.1f}, diff={diff:.1f}")
+
+# Sort by diff value to separate NS from EW groups
+light_data.sort(key=lambda x: x[4])
+
+# Split at midpoint — ensures balanced groups
+mid = len(light_data) // 2
+print(f"Midpoint split at index {mid} of {len(light_data)} lights")
+
 group_A = []
 group_B = []
-for light in intersections[0]:
-    lyaw = light.get_transform().rotation.yaw
-    # Angular distance from approach-road axis (allow ±180° flip)
-    diff = abs((lyaw - road_yaw + 180) % 360 - 180)
-    diff = min(diff, abs(diff - 180))   # also check the opposite direction
-    if diff < 45:
-        group_A.append(light)
-    else:
-        group_B.append(light)
 
-if not group_A:
-    group_A = list(intersections[0])
-if not group_B:
-    # Geometry detection failed — split evenly to avoid silent all-red
-    mid = len(group_A) // 2
-    group_B = group_A[mid:]
-    group_A = group_A[:mid]
-print(f"Signal groups — A (approach road axis): {len(group_A)} lights, "
-      f"B (cross axis): {len(group_B)} lights")
+# Lower diff values (dx closer to dy, or dx smaller) → NS arm
+for i in range(mid):
+    _, light, _, _, _ = light_data[i]
+    group_A.append(light)
+
+# Higher diff values (dx much larger than dy) → EW arm
+for i in range(mid, len(light_data)):
+    _, light, _, _, _ = light_data[i]
+    group_B.append(light)
+
+# Safety check
+if not group_A or not group_B:
+    print("WARNING: Unbalanced grouping detected, attempting recovery...")
+    if not group_A:
+        group_A = main_intersection_lights[:len(main_intersection_lights)//2]
+    if not group_B:
+        group_B = main_intersection_lights[len(main_intersection_lights)//2:]
+
+print(f"BALANCED Signal groups — A (NS arm): {len(group_A)} lights, "
+      f"B (EW arm): {len(group_B)} lights")
 
 # ── CAM 2: True top-down intersection view ────────────────────────────────
 #
@@ -739,14 +768,29 @@ def set_phase(phase_idx):
     Lights are already frozen; set_state() is permanent until next call.
     """
     if phase_idx == 0:
-        for l in group_A: l.set_state(carla.TrafficLightState.Green)
-        for l in group_B: l.set_state(carla.TrafficLightState.Red)
+        print(f"[SIGNAL] Phase 0: Setting {len(group_A)} group_A lights to GREEN, {len(group_B)} group_B lights to RED")
+        for i, l in enumerate(group_A):
+            l.set_state(carla.TrafficLightState.Green)
+            print(f"  group_A[{i}] @ ({l.get_location().x:.1f}, {l.get_location().y:.1f}) → GREEN")
+        for i, l in enumerate(group_B):
+            l.set_state(carla.TrafficLightState.Red)
+            print(f"  group_B[{i}] @ ({l.get_location().x:.1f}, {l.get_location().y:.1f}) → RED")
     elif phase_idx == 1:
-        for l in group_A: l.set_state(carla.TrafficLightState.Yellow)
-        for l in group_B: l.set_state(carla.TrafficLightState.Red)
-    else:
-        for l in group_A: l.set_state(carla.TrafficLightState.Red)
-        for l in group_B: l.set_state(carla.TrafficLightState.Green)
+        print(f"[SIGNAL] Phase 1: Setting {len(group_A)} group_A lights to YELLOW, {len(group_B)} group_B lights to RED")
+        for i, l in enumerate(group_A):
+            l.set_state(carla.TrafficLightState.Yellow)
+            print(f"  group_A[{i}] @ ({l.get_location().x:.1f}, {l.get_location().y:.1f}) → YELLOW")
+        for i, l in enumerate(group_B):
+            l.set_state(carla.TrafficLightState.Red)
+            print(f"  group_B[{i}] @ ({l.get_location().x:.1f}, {l.get_location().y:.1f}) → RED")
+    else:  # phase_idx == 2 or other
+        print(f"[SIGNAL] Phase 2: Setting {len(group_A)} group_A lights to RED, {len(group_B)} group_B lights to GREEN")
+        for i, l in enumerate(group_A):
+            l.set_state(carla.TrafficLightState.Red)
+            print(f"  group_A[{i}] @ ({l.get_location().x:.1f}, {l.get_location().y:.1f}) → RED")
+        for i, l in enumerate(group_B):
+            l.set_state(carla.TrafficLightState.Green)
+            print(f"  group_B[{i}] @ ({l.get_location().x:.1f}, {l.get_location().y:.1f}) → GREEN")
 
 def set_all_red():
     """Set all signals to RED — used during pre-clearance phase."""
@@ -754,6 +798,33 @@ def set_all_red():
         l.set_state(carla.TrafficLightState.Red)
     for l in group_B:
         l.set_state(carla.TrafficLightState.Red)
+
+def verify_light_states():
+    """Debug function: print current state of ALL lights to verify control."""
+    print("[DEBUG] Current light states:")
+    green_count = 0
+    yellow_count = 0
+    red_count = 0
+    for i, l in enumerate(group_A):
+        state = l.get_state()
+        state_name = "GREEN" if state == carla.TrafficLightState.Green else \
+                     "YELLOW" if state == carla.TrafficLightState.Yellow else "RED"
+        print(f"  group_A[{i}] @ ({l.get_location().x:.1f}, {l.get_location().y:.1f}): {state_name}")
+        if state == carla.TrafficLightState.Green: green_count += 1
+        elif state == carla.TrafficLightState.Yellow: yellow_count += 1
+        else: red_count += 1
+    for i, l in enumerate(group_B):
+        state = l.get_state()
+        state_name = "GREEN" if state == carla.TrafficLightState.Green else \
+                     "YELLOW" if state == carla.TrafficLightState.Yellow else "RED"
+        print(f"  group_B[{i}] @ ({l.get_location().x:.1f}, {l.get_location().y:.1f}): {state_name}")
+        if state == carla.TrafficLightState.Green: green_count += 1
+        elif state == carla.TrafficLightState.Yellow: yellow_count += 1
+        else: red_count += 1
+    print(f"[DEBUG] Total: {green_count} GREEN, {yellow_count} YELLOW, {red_count} RED")
+    if green_count > 2:
+        print(f"[ALERT] WARNING! {green_count} lights are GREEN simultaneously! Expected at most 2-4 total")
+    return green_count, yellow_count, red_count
 
 def set_signals_for_emergency(emg_vehicles):
     """
@@ -1267,6 +1338,10 @@ try:
             if ov is not None:
                 overview_frame = ov
 
+            # Verify light states every 50 ticks to catch multiple-green issues
+            if tick_count % 50 == 0:
+                verify_light_states()
+
             # Update rolling wait-time history
             s = wait_trackers[0].get_stats()
             wait_history[0].append(s['avg_waiting_time'])
@@ -1356,6 +1431,7 @@ try:
                     system_mode      = 'PRE_CLEAR'
                     preclear_counter = PRECLEAR_TICKS
                     set_all_red()
+                    verify_light_states()  # Confirm all RED during pre-clear
                     print(f"[PRE_CLEAR] Grace expired — all RED for "
                           f"{PRECLEAR_TICKS} ticks.")
                     phases[0] = 2
@@ -1391,6 +1467,7 @@ try:
                     phase_durations[0] = 9999
                     print(f"[EMERGENCY] Override ACTIVE (arm {arm}): "
                           f"approach GREEN, all others RED.")
+                    verify_light_states()  # Confirm emergency signals applied
                 else:
                     system_mode = 'DQN'
                     print(f"[PRE_CLEAR] Vehicle cleared — back to DQN.")
