@@ -1,13 +1,10 @@
 """
-evaluate.py — Clean evaluation of 3 policies
-Runs each policy for 30 episodes and records real waiting time metrics.
+evaluate.py — DQN-only evaluation with intelligent phase switching.
 
 Usage:
-    python evaluate.py --policy dqn      # trained DQN agent
-    python evaluate.py --policy fixed    # fixed 30s per phase
-    python evaluate.py --policy random   # random phase selection
+    python evaluate.py --policy dqn
 
-Results saved to: data/eval_{policy}.csv
+Results saved to: data/eval_dqn.csv
 """
 
 import carla
@@ -22,14 +19,14 @@ import cv2
 from ultralytics import YOLO
 import threading
 
-from dqn_agent   import DQNAgent, build_state, dqn_phase_duration
+from dqn_agent   import DQNAgent, build_state
 from waiting_time import IntersectionWaitingTimeTracker
 
 # ── Args ───────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
 parser.add_argument('--policy',   default='dqn',
-                    choices=['dqn','fixed','random'],
-                    help='Policy to evaluate')
+                    choices=['dqn'],
+                    help='Policy to evaluate (DQN only)')
 parser.add_argument('--episodes', default=30, type=int,
                     help='Number of evaluation episodes')
 parser.add_argument('--ep_len',   default=500, type=int,
@@ -113,17 +110,18 @@ for i, group in enumerate(intersections):
 ROI_RADIUS = 50
 
 # ── Waiting time trackers ──────────────────────────────────────────────────
-wait_trackers = [IntersectionWaitingTimeTracker(i+1, ROI_RADIUS)
+wait_trackers = [IntersectionWaitingTimeTracker(i+1, ROI_RADIUS, intersection_centers[i])
                  for i in range(NUM_INT)]
 
 # ── Spawn vehicles ─────────────────────────────────────────────────────────
 blueprints   = world.get_blueprint_library().filter("vehicle.*")
 car_bps      = [bp for bp in blueprints
-                if int(bp.get_attribute('number_of_wheels').as_int()) >= 4]
+                if int(bp.get_attribute('number_of_wheels').as_int()) >= 4
+                and not any(kw in bp.id.lower() for kw in EMERGENCY_KW)]
 spawn_points = world.get_map().get_spawn_points()
 vehicles     = []
 
-for sp in spawn_points[:30]:
+for sp in spawn_points[:120]:
     bp = random.choice(car_bps)
     v  = world.try_spawn_actor(bp, sp)
     if v:
@@ -134,7 +132,7 @@ for center in intersection_centers:
     nearby = [sp for sp in spawn_points if sp.location.distance(center)<80]
     n = 0
     for sp in nearby:
-        if n >= 15: break
+        if n >= 35: break
         bp = random.choice(car_bps)
         v  = world.try_spawn_actor(bp, sp)
         if v:
@@ -210,39 +208,103 @@ def compute_gt(center):
             speed_sum += math.sqrt(vel.x**2+vel.y**2+vel.z**2)
     return count, (speed_sum/count if count>0 else 0.0)
 
-def check_emergency(center):
+def get_arm_counts(actors, center):
+    """Count vehicles per approach arm (N/S/E/W). +X=East, +Y=South in CARLA."""
+    n = s = e = w = 0
+    for v in actors:
+        loc = v.get_location()
+        if loc.distance(center) < ROI_RADIUS:
+            dx = loc.x - center.x
+            dy = loc.y - center.y
+            if abs(dx) >= abs(dy):
+                if dx >= 0: e += 1
+                else:       w += 1
+            else:
+                if dy >= 0: s += 1
+                else:       n += 1
+    return n, s, e, w
+
+def is_emergency_vehicle(v):
+    role = str(v.attributes.get('role_name', '')).lower()
+    return role == 'emergency' or any(kw in v.type_id.lower() for kw in EMERGENCY_KW)
+
+def find_emergency_in_roi(center):
     for v in world.get_actors().filter("vehicle.*"):
+        if not v.is_alive:
+            continue
         if v.get_location().distance(center) < ROI_RADIUS:
-            if any(kw in v.type_id.lower() for kw in EMERGENCY_KW):
-                return 1
-    return 0
+            if is_emergency_vehicle(v):
+                return v
+    return None
+
+def set_emergency_phase(group, emg_vehicle):
+    emg_loc = emg_vehicle.get_location()
+    closest = min(group, key=lambda l: l.get_location().distance(emg_loc))
+    for light in group:
+        if light == closest:
+            light.set_state(carla.TrafficLightState.Green)
+        else:
+            light.set_state(carla.TrafficLightState.Red)
 
 # ── Signal control ─────────────────────────────────────────────────────────
-phase_states = [carla.TrafficLightState.Green,
-                carla.TrafficLightState.Yellow,
-                carla.TrafficLightState.Red]
+PHASE_NS_GREEN = 0
+PHASE_YELLOW   = 1
+PHASE_EW_GREEN = 2
 
-FIXED_DURATION = int(30 / 0.05)   # 30 seconds in ticks = 600
+YELLOW_TICKS = 20  # ~1s at 0.05s tick
 
-def set_phase(group, state):
+phase_states      = [PHASE_NS_GREEN] * NUM_INT
+phase_counters    = [0] * NUM_INT
+yellow_remaining  = [0] * NUM_INT
+yellow_targets    = [PHASE_EW_GREEN] * NUM_INT
+intersection_arms = []
+
+def _angle_diff(a, b):
+    return abs((a - b + 180) % 360 - 180)
+
+def split_intersection_arms(group):
+    """Split each intersection's lights into two opposing movement arms."""
+    if not group:
+        return [], []
+
+    ref_yaw = group[0].get_transform().rotation.yaw
+    arm_ns, arm_ew = [], []
+
     for light in group:
-        light.set_state(state)
+        lyaw = light.get_transform().rotation.yaw
+        diff = _angle_diff(lyaw, ref_yaw)
+        if diff < 45 or diff > 135:
+            arm_ns.append(light)
+        else:
+            arm_ew.append(light)
 
-def get_action(policy, idx, state, yolo_count):
-    if policy == 'dqn':
-        return agents[idx].act(state)
-    elif policy == 'fixed':
-        return 0   # always keep current phase (duration handles switching)
-    elif policy == 'random':
-        return random.randint(0, 1)
+    if not arm_ns or not arm_ew:
+        mid = max(1, len(group) // 2)
+        arm_ns = list(group[:mid])
+        arm_ew = list(group[mid:])
+    return arm_ns, arm_ew
 
-def get_duration(policy, action, yolo_count):
-    if policy == 'fixed':
-        return FIXED_DURATION
-    elif policy == 'random':
-        return random.choice([40, 80, 120])
+for g in intersections:
+    intersection_arms.append(split_intersection_arms(g))
+
+def apply_phase(idx, phase):
+    arm_ns, arm_ew = intersection_arms[idx]
+    if phase == PHASE_NS_GREEN:
+        for l in arm_ns: l.set_state(carla.TrafficLightState.Green)
+        for l in arm_ew: l.set_state(carla.TrafficLightState.Red)
+    elif phase == PHASE_YELLOW:
+        if yellow_targets[idx] == PHASE_EW_GREEN:
+            for l in arm_ns: l.set_state(carla.TrafficLightState.Yellow)
+            for l in arm_ew: l.set_state(carla.TrafficLightState.Red)
+        else:
+            for l in arm_ns: l.set_state(carla.TrafficLightState.Red)
+            for l in arm_ew: l.set_state(carla.TrafficLightState.Yellow)
     else:
-        return dqn_phase_duration(action, yolo_count)
+        for l in arm_ns: l.set_state(carla.TrafficLightState.Red)
+        for l in arm_ew: l.set_state(carla.TrafficLightState.Green)
+
+for i in range(NUM_INT):
+    apply_phase(i, PHASE_NS_GREEN)
 
 # ── CSV output ─────────────────────────────────────────────────────────────
 os.makedirs("data", exist_ok=True)
@@ -263,31 +325,50 @@ emergency_vehicle = None
 
 def spawn_emergency():
     lib = world.get_blueprint_library()
-    bps = list(lib.filter("vehicle.*ambulance*")) + \
-          list(lib.filter("vehicle.*firetruck*"))
-    if not bps: return None
+    ambulance_bps = list(lib.filter("vehicle.*ambulance*"))
+    fallback_bps  = (list(lib.filter("vehicle.*firetruck*")) +
+                     list(lib.filter("vehicle.*police*")))
+    generic_bps   = [bp for bp in lib.filter("vehicle.*")
+                     if int(bp.get_attribute('number_of_wheels').as_int()) >= 4]
+    bps = ambulance_bps if ambulance_bps else fallback_bps
+    if not bps:
+        bps = generic_bps
+    if not bps:
+        return None
+
     center = random.choice(intersection_centers)
-    nearby = [sp for sp in world.get_map().get_spawn_points()
-              if sp.location.distance(center) < 100]
-    sp = random.choice(nearby) if nearby else \
-         random.choice(world.get_map().get_spawn_points())
-    v  = world.try_spawn_actor(random.choice(bps), sp)
+    all_sps = world.get_map().get_spawn_points()
+    nearby = [sp for sp in all_sps if sp.location.distance(center) < 180]
+    candidates = nearby if nearby else all_sps
+    random.shuffle(candidates)
+
+    v = None
+    for sp in candidates[:150]:
+        bp = random.choice(bps)
+        if bp.has_attribute('role_name'):
+            bp.set_attribute('role_name', 'emergency')
+        v = world.try_spawn_actor(bp, sp)
+        if v:
+            break
+
     if v:
         v.set_autopilot(True)
+        traffic_manager.ignore_lights_percentage(v, 100)
+        traffic_manager.ignore_signs_percentage(v, 100)
+        traffic_manager.ignore_vehicles_percentage(v, 100)
+        traffic_manager.auto_lane_change(v, True)
+        traffic_manager.vehicle_percentage_speed_difference(v, -80)
+        traffic_manager.distance_to_leading_vehicle(v, 0.5)
     return v
 
 # ── Main evaluation loop ───────────────────────────────────────────────────
 print(f"\nStarting evaluation — {args.episodes} episodes × {args.ep_len} ticks\n")
 
 YOLO_INTERVAL      = 10
-EMERGENCY_INTERVAL = 400
-EMERGENCY_LIFETIME = 300
+EMERGENCY_INTERVAL = 120
+EMERGENCY_LIFETIME = 260
 
-phases          = [0] * NUM_INT
-counters        = [0] * NUM_INT
-phase_durations = [FIXED_DURATION if args.policy=='fixed' else 100] * NUM_INT
 yolo_counts     = [0] * NUM_INT
-prev_states     = [None] * NUM_INT
 
 # Episode-level result storage
 episode_results = []
@@ -337,35 +418,54 @@ try:
             # Per-intersection control
             for idx, center in enumerate(intersection_centers):
                 gt_count, avg_speed = compute_gt(center)
-                emergency_flag      = check_emergency(center)
+                arm_n, arm_s, arm_e, arm_w = get_arm_counts(all_actors, center)
+                emg_v          = find_emergency_in_roi(center)
+                emergency_flag = 1 if emg_v is not None else 0
 
+                wait_stats_now = wait_trackers[idx].get_stats()
                 state = build_state(
-                    yolo_count      = yolo_counts[idx],
-                    gt_count        = gt_count,
-                    avg_speed       = avg_speed,
-                    current_phase   = phases[idx],
-                    phase_counter   = counters[idx],
-                    phase_duration  = phase_durations[idx],
+                    arm_n_queue     = wait_stats_now['arm_queues']['N'],
+                    arm_s_queue     = wait_stats_now['arm_queues']['S'],
+                    arm_e_queue     = wait_stats_now['arm_queues']['E'],
+                    arm_w_queue     = wait_stats_now['arm_queues']['W'],
+                    arm_n_wait      = wait_stats_now['arm_avg_waits']['N'],
+                    arm_s_wait      = wait_stats_now['arm_avg_waits']['S'],
+                    arm_e_wait      = wait_stats_now['arm_avg_waits']['E'],
+                    arm_w_wait      = wait_stats_now['arm_avg_waits']['W'],
+                    current_phase   = phase_states[idx],
+                    phase_counter   = phase_counters[idx],
                     emergency_flag  = emergency_flag,
-                    elapsed_seconds = ep_tick * 0.05
+                    elapsed_seconds = ep_tick * 0.05,
                 )
 
-                if emergency_flag == 1:
-                    set_phase(intersections[idx], carla.TrafficLightState.Green)
-                    phases[idx]   = 0
-                    counters[idx] = 0
-                    action        = 0
+                if emergency_flag == 1 and emg_v.is_alive:
+                    set_emergency_phase(intersections[idx], emg_v)
+                    phase_states[idx] = PHASE_NS_GREEN
+                    phase_counters[idx] = 0
+                    yellow_remaining[idx] = 0
+                    yellow_targets[idx] = PHASE_EW_GREEN
+                    action = 0
                 else:
-                    action = get_action(args.policy, idx, state, yolo_counts[idx])
+                    action = agents[idx].act(state)
 
-                counters[idx] += 1
-                if counters[idx] >= phase_durations[idx]:
-                    counters[idx]        = 0
-                    phases[idx]          = (phases[idx]+1) % len(phase_states)
-                    phase_durations[idx] = get_duration(args.policy,
-                                                        action,
-                                                        yolo_counts[idx])
-                    set_phase(intersections[idx], phase_states[phases[idx]])
+                    if phase_states[idx] == PHASE_YELLOW:
+                        yellow_remaining[idx] = max(0, yellow_remaining[idx] - 1)
+                        if yellow_remaining[idx] == 0:
+                            phase_states[idx] = yellow_targets[idx]
+                            phase_counters[idx] = 0
+                            apply_phase(idx, phase_states[idx])
+                    else:
+                        if action == 1:
+                            prev_phase = phase_states[idx]
+                            phase_states[idx] = PHASE_YELLOW
+                            phase_counters[idx] = 0
+                            yellow_remaining[idx] = YELLOW_TICKS
+                            yellow_targets[idx] = (PHASE_EW_GREEN
+                                                   if prev_phase == PHASE_NS_GREEN
+                                                   else PHASE_NS_GREEN)
+                            apply_phase(idx, PHASE_YELLOW)
+
+                phase_counters[idx] += 1
 
                 # Log every 10 ticks
                 if ep_tick % 10 == 0:
@@ -373,7 +473,7 @@ try:
                     csv_writer.writerow([
                         episode, idx+1, ep_tick,
                         yolo_counts[idx], gt_count,
-                        round(avg_speed,3), phases[idx], action,
+                        round(avg_speed,3), phase_states[idx], action,
                         stats['avg_waiting_time'],
                         stats['max_waiting_time'],
                         stats['queue_length'],

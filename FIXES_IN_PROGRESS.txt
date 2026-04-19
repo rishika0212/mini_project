@@ -1,0 +1,11 @@
+EMERGENCY SYSTEM FIXES
+======================
+
+Three critical fixes needed:
+
+FIX 1: FIXED_TIME Phase Cycling (STUCK ON RED)
+FIX 2: Emergency Vehicle Lifecycle
+FIX 3: Vehicle Speed Increase
+FIX 4: Camera Positioning & Detection
+
+Running fixes now...

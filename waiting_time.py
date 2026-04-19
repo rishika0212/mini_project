@@ -1,35 +1,46 @@
 # ==============================
 # WAITING TIME TRACKER
-# Tracks per-vehicle waiting time accurately
+# Tracks per-vehicle waiting time accurately, with per-arm breakdowns.
 #
 # A vehicle is "waiting" if its speed < 0.5 m/s
-# Waiting time = total seconds spent waiting near an intersection
+# Arms: N / S / E / W — determined by vehicle position relative to center.
+#   CARLA coords: +X ≈ East, +Y ≈ South (UE4 left-hand system)
 #
 # Metrics computed:
 #   - avg_waiting_time   : average seconds waited per vehicle per episode
 #   - max_waiting_time   : worst case vehicle wait
 #   - throughput         : vehicles that passed through intersection per minute
 #   - queue_length       : how many vehicles waiting at any moment
+#   - arm_queues         : {N,S,E,W} count of waiting vehicles per arm
+#   - arm_avg_waits      : {N,S,E,W} avg waiting time per arm (seconds)
 # ==============================
 
 import math
-import time
 
 WAITING_SPEED_THRESHOLD = 0.5   # m/s — below this = waiting
 TICK_DURATION           = 0.05  # seconds per tick (fixed_delta_seconds)
 
 
+def _get_arm(loc, center):
+    """Classify a vehicle into N/S/E/W approach arm relative to intersection center."""
+    dx = loc.x - center.x   # +ve = East
+    dy = loc.y - center.y   # +ve = South (CARLA UE4 left-hand)
+    if abs(dx) >= abs(dy):
+        return 'E' if dx >= 0 else 'W'
+    return 'S' if dy >= 0 else 'N'
+
+
 class VehicleWaitTracker:
     """Tracks waiting time for a single vehicle."""
 
-    def __init__(self, vehicle_id, start_tick):
+    def __init__(self, vehicle_id, start_tick, arm='?'):
         self.vehicle_id    = vehicle_id
         self.start_tick    = start_tick
         self.waiting_ticks = 0
         self.total_ticks   = 0
         self.is_waiting    = False
-        self.wait_start    = None
-        self.passed        = False   # has this vehicle cleared the intersection
+        self.passed        = False
+        self.arm           = arm   # 'N', 'S', 'E', or 'W'
 
     def update(self, speed, current_tick):
         self.total_ticks += 1
@@ -56,9 +67,10 @@ class IntersectionWaitingTimeTracker:
     Call reset_episode() at episode boundaries.
     """
 
-    def __init__(self, intersection_id, roi_radius=50):
+    def __init__(self, intersection_id, roi_radius=50, center=None):
         self.intersection_id = intersection_id
         self.roi_radius      = roi_radius
+        self.center          = center   # carla.Location (needs .x, .y attributes)
 
         # Active trackers: vehicle_id -> VehicleWaitTracker
         self.active   = {}
@@ -82,16 +94,18 @@ class IntersectionWaitingTimeTracker:
         # Get vehicles currently in ROI
         in_roi = {}
         for v in world_actors:
-            dist = v.get_location().distance(center)
+            loc  = v.get_location()
+            dist = loc.distance(center)
             if dist < self.roi_radius:
                 vel   = v.get_velocity()
                 speed = math.sqrt(vel.x**2 + vel.y**2 + vel.z**2)
-                in_roi[v.id] = speed
+                arm   = _get_arm(loc, center)
+                in_roi[v.id] = (speed, arm)
 
         # Update active trackers
-        for vid, speed in in_roi.items():
+        for vid, (speed, arm) in in_roi.items():
             if vid not in self.active:
-                self.active[vid] = VehicleWaitTracker(vid, current_tick)
+                self.active[vid] = VehicleWaitTracker(vid, current_tick, arm)
             self.active[vid].update(speed, current_tick)
 
         # Detect vehicles that left ROI → mark as completed
@@ -104,16 +118,29 @@ class IntersectionWaitingTimeTracker:
                 self.throughput_count += 1
 
     def get_stats(self):
-        """Returns current episode statistics."""
+        """Returns current episode statistics including per-arm breakdowns."""
         # Include active vehicles still in ROI
         all_waits = self.episode_waiting_times.copy()
         for tracker in self.active.values():
             if tracker.total_ticks > 10:
                 all_waits.append(tracker.waiting_time_seconds)
 
-        # Current queue length
-        queue_length = sum(1 for t in self.active.values()
-                           if t.is_waiting)
+        # Overall queue length
+        queue_length = sum(1 for t in self.active.values() if t.is_waiting)
+
+        # Per-arm stats (from currently active vehicles)
+        arm_queues    = {'N': 0, 'S': 0, 'E': 0, 'W': 0}
+        arm_wait_secs = {'N': [], 'S': [], 'E': [], 'W': []}
+        for t in self.active.values():
+            arm = t.arm
+            if arm in arm_queues:
+                if t.is_waiting:
+                    arm_queues[arm] += 1
+                arm_wait_secs[arm].append(t.waiting_time_seconds)
+        arm_avg_waits = {
+            arm: (sum(ws) / len(ws)) if ws else 0.0
+            for arm, ws in arm_wait_secs.items()
+        }
 
         if all_waits:
             avg_wait = sum(all_waits) / len(all_waits)
@@ -135,11 +162,12 @@ class IntersectionWaitingTimeTracker:
             'throughput_vpm'   : round(throughput, 3),
             'vehicles_tracked' : len(all_waits),
             'vehicles_in_roi'  : len(self.active),
+            'arm_queues'       : arm_queues,
+            'arm_avg_waits'    : arm_avg_waits,
         }
 
     def reset_episode(self):
         """Call at episode boundary to reset per-episode stats."""
-        # Save completed waiting times
         for tracker in self.active.values():
             if tracker.total_ticks > 10:
                 self.completed.append(tracker)

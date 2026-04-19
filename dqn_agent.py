@@ -8,12 +8,35 @@ import os
 # DEEP Q-NETWORK AGENT
 # ==============================
 
-STATE_SIZE  = 7
-ACTION_SIZE = 2
+# STATE (12 features):
+#   [0]  arm_N_queue  — vehicles waiting on North arm  (normalised)
+#   [1]  arm_S_queue  — vehicles waiting on South arm  (normalised)
+#   [2]  arm_E_queue  — vehicles waiting on East arm   (normalised)
+#   [3]  arm_W_queue  — vehicles waiting on West arm   (normalised)
+#   [4]  arm_N_wait   — avg wait time, North arm       (normalised)
+#   [5]  arm_S_wait   — avg wait time, South arm       (normalised)
+#   [6]  arm_E_wait   — avg wait time, East arm        (normalised)
+#   [7]  arm_W_wait   — avg wait time, West arm        (normalised)
+#   [8]  active_phase — current green phase 0-3        (normalised /3)
+#   [9]  phase_time   — ticks spent in current phase   (normalised)
+#   [10] time_of_day  — elapsed time modulo 10 min     (normalised)
+#   [11] emergency    — 1 if emergency vehicle in ROI
+
+# ACTION (4):
+#   0 = Phase 0 — NS Straight + Right  (N & S green, E & W red)
+#   1 = Phase 1 — NS Left turns        (N & S green protected left)
+#   2 = Phase 2 — EW Straight + Right  (E & W green, N & S red)
+#   3 = Phase 3 — EW Left turns        (E & W green protected left)
+#
+# DQN chooses the NEXT desired phase. Transition (yellow → all-red) is
+# hardcoded in main.py and not controlled by the agent.
+
+STATE_SIZE  = 12
+ACTION_SIZE = 4   # choose next phase (0-3)
 
 MAX_VEHICLES = 30.0
-MAX_SPEED    = 15.0
-MAX_DURATION = 200.0
+MAX_WAIT     = 120.0   # seconds — used to normalise waiting time
+MAX_DURATION = 600.0   # 30 s max green in ticks (600 ticks × 0.05 s)
 
 
 class DQNAgent:
@@ -39,12 +62,12 @@ class DQNAgent:
 
         self.memory = deque(maxlen=memory_size)
 
-        # Network weights: 7 -> 32 -> 32 -> 2
-        self.w1 = np.random.randn(state_size, 32) * 0.1
-        self.b1 = np.zeros((1, 32))
-        self.w2 = np.random.randn(32, 32) * 0.1
-        self.b2 = np.zeros((1, 32))
-        self.w3 = np.random.randn(32, action_size) * 0.1
+        # Network weights: 12 -> 64 -> 64 -> 4
+        self.w1 = np.random.randn(state_size, 64) * 0.1
+        self.b1 = np.zeros((1, 64))
+        self.w2 = np.random.randn(64, 64) * 0.1
+        self.b2 = np.zeros((1, 64))
+        self.w3 = np.random.randn(64, action_size) * 0.1
         self.b3 = np.zeros((1, action_size))
 
         # Target network
@@ -98,7 +121,7 @@ class DQNAgent:
         next_states = np.array([b[3] for b in batch])
         dones       = np.array([b[4] for b in batch])
 
-        q_current,h1,h2 = self.forward(states)
+        q_current,_,_ = self.forward(states)
         q_next,_,_       = self.forward(next_states, use_target=True)
         q_target         = q_current.copy()
 
@@ -109,7 +132,7 @@ class DQNAgent:
                 q_target[i, actions[i]] = rewards[i] + \
                     self.gamma * np.max(q_next[i])
 
-        loss = self._backprop(states, q_target, h1, h2)
+        loss = self._backprop(states, q_target)
 
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
@@ -120,8 +143,8 @@ class DQNAgent:
 
         return loss
 
-    def _backprop(self, x, q_target, h1, h2):
-        batch       = x.shape[0]
+    def _backprop(self, x, q_target):
+        batch        = x.shape[0]
         q_pred,h1_c,h2_c = self.forward(x)
 
         d_out = (q_pred - q_target) / batch
@@ -175,6 +198,12 @@ class DQNAgent:
             return
         with open(path) as f:
             data = json.load(f)
+        # Guard against stale weights from an older state-size
+        saved_input_size = np.array(data['w1']).shape[0]
+        if saved_input_size != self.state_size:
+            print(f"  Weight size mismatch (saved input={saved_input_size}, "
+                  f"current={self.state_size}) — starting fresh.")
+            return
         self.w1 = np.array(data['w1']); self.b1 = np.array(data['b1'])
         self.w2 = np.array(data['w2']); self.b2 = np.array(data['b2'])
         self.w3 = np.array(data['w3']); self.b3 = np.array(data['b3'])
@@ -189,57 +218,102 @@ class DQNAgent:
 # STATE BUILDER
 # ==============================
 
-def build_state(yolo_count, gt_count, avg_speed,
-                current_phase, phase_counter, phase_duration,
+def build_state(arm_n_queue, arm_s_queue, arm_e_queue, arm_w_queue,
+                arm_n_wait,  arm_s_wait,  arm_e_wait,  arm_w_wait,
+                current_phase, phase_counter,
                 emergency_flag, elapsed_seconds):
+    """
+    Build the 12-element normalised state vector fed to the DQN.
+
+    Parameters
+    ----------
+    arm_*_queue  : int   – vehicles currently waiting (speed < 0.5 m/s) per arm
+    arm_*_wait   : float – avg waiting time (seconds) for vehicles on that arm
+    current_phase: int   – active green phase (0-3); during transitions this is
+                           the phase just ended (agent sees pending decision context)
+    phase_counter: int   – ticks spent in the current green phase
+    emergency_flag: int  – 1 if emergency vehicle detected in ROI
+    elapsed_seconds: float – simulation time used to derive time-of-day
+    """
     time_norm = (elapsed_seconds % 600) / 600.0
     return np.array([
-        min(yolo_count,  MAX_VEHICLES) / MAX_VEHICLES,
-        min(gt_count,    MAX_VEHICLES) / MAX_VEHICLES,
-        min(avg_speed,   MAX_SPEED)    / MAX_SPEED,
-        current_phase  / 2.0,
-        min(phase_counter, MAX_DURATION) / MAX_DURATION,
-        time_norm,
-        float(emergency_flag),
+        min(arm_n_queue, MAX_VEHICLES) / MAX_VEHICLES,   # North arm queue
+        min(arm_s_queue, MAX_VEHICLES) / MAX_VEHICLES,   # South arm queue
+        min(arm_e_queue, MAX_VEHICLES) / MAX_VEHICLES,   # East  arm queue
+        min(arm_w_queue, MAX_VEHICLES) / MAX_VEHICLES,   # West  arm queue
+        min(arm_n_wait,  MAX_WAIT)     / MAX_WAIT,       # North avg wait
+        min(arm_s_wait,  MAX_WAIT)     / MAX_WAIT,       # South avg wait
+        min(arm_e_wait,  MAX_WAIT)     / MAX_WAIT,       # East  avg wait
+        min(arm_w_wait,  MAX_WAIT)     / MAX_WAIT,       # West  avg wait
+        current_phase  / 3.0,                             # active phase
+        min(phase_counter, MAX_DURATION) / MAX_DURATION, # time in phase
+        time_norm,                                        # time of day
+        float(emergency_flag),                            # emergency
     ], dtype=np.float32)
 
 
 # ==============================
-# REWARD FUNCTION — FIXED
-# Emergency bonus reduced so it doesn't dominate learning
+# REWARD FUNCTION
+#
+# Formula:
+#   R = - α * waiting_time_penalty
+#       - β * queue_length_penalty
+#       + γ * vehicles_cleared_bonus
+#       + δ * speed_bonus
+#       ± emergency_handling
+#       - switching_penalty   (penalise unnecessary phase changes)
+#
+# "Pressure" concept:
+#   The agent learns to give GREEN to the arm with highest pressure
+#   (long queue + long wait). Per-arm state features enable this.
 # ==============================
 
-def compute_reward(yolo_count, avg_speed, current_phase,
-                   emergency_flag, action):
+def compute_reward(avg_speed,
+                   emergency_flag,
+                   switching,
+                   avg_waiting_time=0.0,
+                   queue_length=0,
+                   vehicles_cleared=0):
+    """
+    Reward formula (spec-aligned):
+        R = - α * waiting_time_penalty
+            - β * queue_length_penalty
+            + γ * vehicles_cleared_bonus
+            + δ * avg_speed_bonus
+            + emergency_handling_bonus
+            - switching_penalty
+
+    All terms normalised so individual contributions are on similar scales,
+    preventing any single factor from dominating Q-value learning.
+    """
+    MAX_SPEED = 14.0    # m/s — typical urban speed limit
+
+    # α — penalise long average waiting time (primary metric)
+    wait_norm  = min(avg_waiting_time, MAX_WAIT) / MAX_WAIT
+    reward     = -wait_norm * 6.0
+
+    # β — penalise queue build-up
+    queue_norm = min(queue_length, MAX_VEHICLES) / MAX_VEHICLES
+    reward    -= queue_norm * 3.0
+
+    # γ — reward vehicles cleared through the intersection
+    reward    += min(vehicles_cleared, 15) * 0.4
+
+    # δ — reward free-flowing traffic (speed bonus)
     speed_norm = min(avg_speed, MAX_SPEED) / MAX_SPEED
-    congestion = (min(yolo_count, MAX_VEHICLES) / MAX_VEHICLES) * (1.0 - speed_norm)
-    reward     = -congestion * 10.0        # core: penalise congestion
+    reward    += speed_norm * 2.5
 
-    # FIXED: small emergency bonus (was ±10/5, now ±2)
+    # Emergency handling: bonus when emergency vehicle is in ROI
+    # (the agent should not try to override emergency — it's handled externally,
+    # but a positive signal confirms the priority state is recognised)
     if emergency_flag == 1:
-        if current_phase == 0:             # green — good
-            reward += 2.0
-        else:                              # not green — bad
-            reward -= 2.0
+        reward += 3.0
 
-    # Small penalty for unnecessary phase switching
-    if action == 1:
-        reward -= 0.3
+    # Penalise unnecessary phase switching — stable phases reduce delay spikes
+    if switching:
+        reward -= 0.5
 
     return float(reward)
-
-
-# ==============================
-# PHASE DURATION FROM DQN ACTION
-# ==============================
-
-def dqn_phase_duration(action, yolo_count):
-    if action == 0:                        # keep current phase
-        if yolo_count >= 8:   return 160
-        elif yolo_count >= 4: return 120
-        else:                 return 80
-    else:                                  # switch sooner
-        return 40
 
 
 # ==============================
