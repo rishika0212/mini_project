@@ -11,6 +11,21 @@ from dqn_agent import DQNAgent, build_state
 from fallback import FallbackController, ControlMode
 
 
+def drive_until_mode(controller, state, target_mode, emergency_flag, max_steps=200):
+    """Advance controller updates until target mode appears or timeout."""
+    for _ in range(max_steps):
+        action, mode, override = controller.update(
+            state=state,
+            yolo_confidence=0.8,
+            yolo_count=5,
+            emergency_flag=emergency_flag,
+            emg_vehicle=None,
+        )
+        if mode == target_mode:
+            return action, mode, override
+    raise AssertionError(f"Timed out waiting for mode {target_mode}")
+
+
 def test_system_initialization():
     """Test that system controller initializes correctly."""
     print("\n[TEST 1] System Controller Initialization")
@@ -164,16 +179,10 @@ def test_emergency_clears():
 
     state = np.zeros(12, dtype=np.float32)
 
-    # Go through GRACE -> PRE_CLEAR -> EMERGENCY
-    # (same as test 2, abbreviated)
-    for _ in range(40 + 40):
-        action, mode, override = controller.update(
-            state=state,
-            yolo_confidence=0.8,
-            yolo_count=5,
-            emergency_flag=1,
-            emg_vehicle=None
-        )
+    # Drive through GRACE -> PRE_CLEAR -> EMERGENCY deterministically.
+    drive_until_mode(controller, state, SystemMode.GRACE, emergency_flag=1, max_steps=2)
+    drive_until_mode(controller, state, SystemMode.PRE_CLEAR, emergency_flag=1, max_steps=60)
+    drive_until_mode(controller, state, SystemMode.EMERGENCY, emergency_flag=1, max_steps=60)
 
     assert controller.system_mode == SystemMode.EMERGENCY, "Should be in EMERGENCY"
 

@@ -35,6 +35,7 @@ except ImportError:
 from dqn_agent    import DQNAgent, build_state
 from waiting_time import IntersectionWaitingTimeTracker
 from fallback     import FallbackController, ControlMode, get_yolo_confidence
+from ground_sensors import IntersectionGroundSensors
 
 # ── Connect & load map ────────────────────────────────────────────────────
 # Town03 has straight 4-way intersections and a clean road grid — ideal for
@@ -157,16 +158,26 @@ center = intersection_centers[0]          # single intersection centre
 # ROAD_DETECTION_DIST: fixed range on the approach road that triggers the
 # emergency-override when an emergency vehicle enters it.
 ROI_RADIUS          = 60    # metres — used for queue/wait-time tracking
-ROAD_DETECTION_DIST = 80    # metres from intersection centre to trip emergency
+ROAD_DETECTION_DIST = 75    # keep trigger inside CAM 2 footprint for visible demos
 
 wait_trackers = [IntersectionWaitingTimeTracker(i + 1, ROI_RADIUS, intersection_centers[i])
                  for i in range(NUM_INT)]
+
+# Ground-sensor backend for control decisions (realistic per-arm inputs).
+arm_directions = {'N': 0, 'S': 180, 'E': 90, 'W': 270}
+ground_sensor = IntersectionGroundSensors(
+    intersection_id=1,
+    intersection_center=center,
+    arm_directions=arm_directions,
+)
 
 # ── Fallback controller (Scenario 4: YOLO failure → FIXED_TIME) ──────────
 # Always pass emergency_flag=0 so it only handles DQN ↔ FIXED_TIME switching;
 # emergency is handled separately by the demo state machine.
 fallback_ctrl        = FallbackController(intersection_id=1)
-yolo_conf            = 0.0
+yolo_conf            = 0.0   # visualization confidence (from YOLO camera)
+control_conf         = 0.95  # control confidence (from ground sensors)
+control_count        = 0     # control count (from ground sensors)
 fallback_event_count = 0
 emergency_event_count = 0
 
@@ -174,7 +185,7 @@ emergency_event_count = 0
 # without requiring actual YOLO failure.
 SIM_LC_INTERVAL = 3600   # ~180 s between fallback demo events (3 minutes)
 SIM_LC_DURATION = 160    # ~8 s of forced low conf (> LOW_CONF_WINDOW=5 ticks)
-_sim_lc_timer   = SIM_LC_INTERVAL   # start near threshold → first event soon
+_sim_lc_timer   = 0
 _sim_lc_active  = False
 _sim_lc_dur_ctr = 0
 
@@ -187,11 +198,17 @@ car_bps         = [bp for bp in blueprints
 spawn_points = world.get_map().get_spawn_points()
 vehicles     = []
 
+# Demo density knobs (higher values make DQN behavior more visible on screen).
+GLOBAL_SPAWN_LIMIT   = 240
+NEARBY_SPAWN_LIMIT   = 140
+REPLENISH_TARGET     = 90
+REPLENISH_RADIUS_M   = 180
+
 # Global TM safety margins — set BEFORE spawning so every vehicle inherits them.
 traffic_manager.set_global_distance_to_leading_vehicle(3.0)   # 3 m gap
 traffic_manager.global_percentage_speed_difference(10)         # 10 % below limit
 
-for sp in spawn_points[:180]:
+for sp in spawn_points[:GLOBAL_SPAWN_LIMIT]:
     bp = random.choice(car_bps)
     v  = world.try_spawn_actor(bp, sp)
     if v:
@@ -200,7 +217,7 @@ for sp in spawn_points[:180]:
 nearby_sps = [sp for sp in spawn_points if sp.location.distance(center) < 80]
 n = 0
 for sp in nearby_sps:
-    if n >= 100: break  # Increased from 50 to 100 for denser traffic
+    if n >= NEARBY_SPAWN_LIMIT: break
     bp = random.choice(car_bps)
     v  = world.try_spawn_actor(bp, sp)
     if v:
@@ -297,60 +314,46 @@ _approach_spawn_candidates.sort(key=lambda sp: sp.location.distance(center),
                                 reverse=True)
 print(f"Approach arm spawn candidates (30-65 m, farthest first): {len(_approach_spawn_candidates)}")
 
-# ── Split intersection lights into two perpendicular groups (BALANCED) ────
-# Get ALL traffic lights within 100m of intersection center
-# Sort by X-Y distance difference and split at midpoint to ensure perfect balance
-# This avoids uneven splits like 3-1 that caused multiple lights green simultaneously
-all_traffic_lights = world.get_actors().filter("traffic.traffic_light")
-main_intersection_lights = []
+# ── Split selected intersection lights into two movement groups ────────────
+# Only use the chosen intersection actor group to avoid mixing nearby junctions.
+def _angle_diff(a, b):
+    return abs((a - b + 180) % 360 - 180)
 
-for light in all_traffic_lights:
-    dist = light.get_location().distance(center)
-    if dist < 100:  # 100m search radius
-        main_intersection_lights.append(light)
+def split_intersection_arms(group):
+    if not group:
+        return [], []
+    ref_yaw = group[0].get_transform().rotation.yaw
+    arm_a, arm_b = [], []
+    for light in group:
+        lyaw = light.get_transform().rotation.yaw
+        diff = _angle_diff(lyaw, ref_yaw)
+        if diff < 45 or diff > 135:
+            arm_a.append(light)
+        else:
+            arm_b.append(light)
+    if not arm_a or not arm_b:
+        mid = max(1, len(group) // 2)
+        arm_a = list(group[:mid])
+        arm_b = list(group[mid:])
+    return arm_a, arm_b
 
-print(f"Total traffic lights found within 100m: {len(main_intersection_lights)}")
+main_intersection_lights = list(intersections[0])
+group_A, group_B = split_intersection_arms(main_intersection_lights)
 
-# Build light data: (index, light_object, dx, dy, dx-dy_diff)
-light_data = []
-for i, light in enumerate(main_intersection_lights):
-    loc = light.get_location()
-    dx = abs(loc.x - center.x)
-    dy = abs(loc.y - center.y)
-    diff = dx - dy
-    light_data.append((i, light, dx, dy, diff))
-    print(f"  Light {i}: pos=({loc.x:.1f}, {loc.y:.1f}), dx={dx:.1f}, dy={dy:.1f}, diff={diff:.1f}")
+def _arm_from_location_for_labels(loc):
+    dx = loc.x - center.x
+    dy = loc.y - center.y
+    if abs(dx) >= abs(dy):
+        return 'E' if dx >= 0 else 'W'
+    return 'S' if dy >= 0 else 'N'
 
-# Sort by diff value to separate NS from EW groups
-light_data.sort(key=lambda x: x[4])
+group_A_arms = sorted({_arm_from_location_for_labels(l.get_location()) for l in group_A})
+group_B_arms = sorted({_arm_from_location_for_labels(l.get_location()) for l in group_B})
 
-# Split at midpoint — ensures balanced groups
-mid = len(light_data) // 2
-print(f"Midpoint split at index {mid} of {len(light_data)} lights")
-
-group_A = []
-group_B = []
-
-# Lower diff values (dx closer to dy, or dx smaller) → NS arm
-for i in range(mid):
-    _, light, _, _, _ = light_data[i]
-    group_A.append(light)
-
-# Higher diff values (dx much larger than dy) → EW arm
-for i in range(mid, len(light_data)):
-    _, light, _, _, _ = light_data[i]
-    group_B.append(light)
-
-# Safety check
-if not group_A or not group_B:
-    print("WARNING: Unbalanced grouping detected, attempting recovery...")
-    if not group_A:
-        group_A = main_intersection_lights[:len(main_intersection_lights)//2]
-    if not group_B:
-        group_B = main_intersection_lights[len(main_intersection_lights)//2:]
-
-print(f"BALANCED Signal groups — A (NS arm): {len(group_A)} lights, "
-      f"B (EW arm): {len(group_B)} lights")
+print(f"Selected intersection lights: {len(main_intersection_lights)}")
+print(f"Signal containers — A: {len(group_A)} lights (arms={group_A_arms}), "
+      f"B: {len(group_B)} lights (arms={group_B_arms})")
+print("[INFO] A/B are CARLA light-head containers only; control pressure uses N/S/E/W separately.")
 
 # ── CAM 2: True top-down intersection view ────────────────────────────────
 #
@@ -394,13 +397,17 @@ for _light in intersections[0]:
     _light.freeze(True)
 print("Traffic lights frozen — manual control active.")
 
-# Force a known valid state before the warm-up ticks run, so the first
-# frame is deterministic.  Phase 2: A=Red, B=Green.
-for _l in group_A: _l.set_state(carla.TrafficLightState.Red)
-for _l in group_B: _l.set_state(carla.TrafficLightState.Green)
-
 print("Cameras ready. Warming up...")
 for _ in range(30): world.tick()
+
+# Initialize to a demand-aligned green state to avoid long startup all-red.
+_startup_actors = list(world.get_actors().filter("vehicle.*"))
+wait_trackers[0].update(_startup_actors, center, 0)
+_startup_waits = wait_trackers[0].get_stats()
+_startup_sensor = ground_sensor.update(_startup_actors, [])
+_a_count = _startup_sensor['arm_counts']['N'] + _startup_sensor['arm_counts']['S']
+_b_count = _startup_sensor['arm_counts']['E'] + _startup_sensor['arm_counts']['W']
+initial_green_phase = 0 if _a_count >= _b_count else 2
 
 # ── Camera projection helpers ──────────────────────────────────────────────
 _CAM_W, _CAM_H = 640, 640
@@ -725,14 +732,19 @@ def is_emergency_vehicle(v):
     role = str(v.attributes.get('role_name', '')).lower()
     return role == 'emergency' or any(kw in v.type_id.lower() for kw in EMERGENCY_KW)
 
+def _is_visible_in_overview(v):
+    return project_actor(v, OVERVIEW_CAM_IDX) is not None
+
 def get_emergency_vehicles(c):
     """Return list of all live emergency vehicles within ROAD_DETECTION_DIST."""
     result = []
     for v in world.get_actors().filter("vehicle.*"):
         if not v.is_alive: continue
-        if v.get_location().distance(c) < ROAD_DETECTION_DIST:
-            # Always recognise the demo-tracked vehicle even if it has a generic blueprint
-            if is_emergency_vehicle(v) or (emergency_vehicle is not None and v.id == emergency_vehicle.id):
+        dist = v.get_location().distance(c)
+        is_tracked = emergency_vehicle is not None and v.id == emergency_vehicle.id
+        if dist < ROAD_DETECTION_DIST:
+            # Only trigger emergency override when vehicle is visible in CAM 2.
+            if (is_emergency_vehicle(v) or is_tracked) and _is_visible_in_overview(v):
                 result.append(v)
     return result
 
@@ -740,10 +752,55 @@ def get_emergency_vehicles(c):
 phase_states       = [carla.TrafficLightState.Green,
                       carla.TrafficLightState.Yellow,
                       carla.TrafficLightState.Red]
-phases          = [0] * NUM_INT
+phases          = [initial_green_phase] * NUM_INT
 counters        = [0] * NUM_INT
 phase_durations = [100] * NUM_INT
 yolo_counts     = [0] * NUM_INT
+pending_green_phase = [0] * NUM_INT
+last_green_phase = [2] * NUM_INT
+last_green_head  = [None] * NUM_INT
+
+latest_arm_stats = {
+    'arm_queues': dict(_startup_sensor['arm_counts']),
+    'arm_avg_waits': dict(_startup_waits['arm_avg_waits']),
+}
+
+latest_sensor_counts = {'N': 0, 'S': 0, 'E': 0, 'W': 0}
+
+DEMAND_EPS = 0.05
+
+def _arm_from_location(loc):
+    dx = loc.x - center.x
+    dy = loc.y - center.y
+    if abs(dx) >= abs(dy):
+        return 'E' if dx >= 0 else 'W'
+    return 'S' if dy >= 0 else 'N'
+
+def _axis_demands(arm_stats):
+    aq = arm_stats['arm_queues']
+    aw = arm_stats['arm_avg_waits']
+
+    # Queue-first demand: if no vehicles are present, ignore stale wait values.
+    ns_q = aq['N'] + aq['S']
+    ew_q = aq['E'] + aq['W']
+    ns_w = (aw['N'] + aw['S']) if ns_q > 0 else 0.0
+    ew_w = (aw['E'] + aw['W']) if ew_q > 0 else 0.0
+
+    ns = ns_q + 0.12 * ns_w
+    ew = ew_q + 0.12 * ew_w
+    return ns, ew
+
+def _phase_pressure(arm_stats, phase_id):
+    # Phase 0 serves N/S demand, phase 2 serves E/W demand.
+    ns, ew = _axis_demands(arm_stats)
+    return ns if phase_id == 0 else ew
+
+def _pick_best_green_phase(arm_stats, default_phase=0):
+    a_pressure = _phase_pressure(arm_stats, 0)
+    b_pressure = _phase_pressure(arm_stats, 2)
+    if a_pressure <= DEMAND_EPS and b_pressure <= DEMAND_EPS:
+        return default_phase
+    return 0 if a_pressure >= b_pressure else 2
 
 # ── State machine ──────────────────────────────────────────────────────────
 # system_mode tracks which of the five control states we are in.
@@ -753,6 +810,9 @@ grace_counter      = 0        # counts down from GRACE_TICKS
 preclear_counter   = 0        # counts down from PRECLEAR_TICKS
 recovery_counter   = 0        # counts down from RECOVERY_TICKS
 emergency_timeout  = 0        # extends GREEN time based on ambulance speed
+emergency_crossed_center = False
+ns_starve_ticks    = 0        # ticks N/S demand is waiting without service
+ew_starve_ticks    = 0        # ticks E/W demand is waiting without service
 
 GRACE_TICKS      = 40     # ~2 s   — detect emergency, prepare for clearance
 PRECLEAR_TICKS   = 40     # ~2 s   — all RED to ensure intersection empty
@@ -767,30 +827,81 @@ def set_phase(phase_idx):
       Phase 2 → A = Red,    B = Green
     Lights are already frozen; set_state() is permanent until next call.
     """
+    def _light_pressure(light):
+        arm = _arm_from_location(light.get_location())
+        q = latest_arm_stats['arm_queues'].get(arm, 0)
+        w = latest_arm_stats['arm_avg_waits'].get(arm, 0.0)
+        return q + 0.2 * w
+
+    def _set_group_state(group, state):
+        for light in group:
+            light.set_state(state)
+
     if phase_idx == 0:
-        print(f"[SIGNAL] Phase 0: Setting {len(group_A)} group_A lights to GREEN, {len(group_B)} group_B lights to RED")
+        # Single active head in A group (highest-pressure arm), all others RED.
+        best_idx = 0
+        best_p = -1.0
         for i, l in enumerate(group_A):
-            l.set_state(carla.TrafficLightState.Green)
-            print(f"  group_A[{i}] @ ({l.get_location().x:.1f}, {l.get_location().y:.1f}) → GREEN")
-        for i, l in enumerate(group_B):
-            l.set_state(carla.TrafficLightState.Red)
-            print(f"  group_B[{i}] @ ({l.get_location().x:.1f}, {l.get_location().y:.1f}) → RED")
+            p = _light_pressure(l)
+            if p > best_p:
+                best_p = p
+                best_idx = i
+        if best_p <= 0.05:
+            print("[SIGNAL] Phase 0: no demand in group_A, holding RED")
+            _set_group_state(group_A, carla.TrafficLightState.Red)
+            _set_group_state(group_B, carla.TrafficLightState.Red)
+            last_green_phase[0] = 0
+            last_green_head[0] = None
+        else:
+            print(f"[SIGNAL] Phase 0: Single GREEN in group_A[{best_idx}] (pressure={best_p:.2f}), others RED")
+            for i, l in enumerate(group_A):
+                st = carla.TrafficLightState.Green if i == best_idx else carla.TrafficLightState.Red
+                l.set_state(st)
+            _set_group_state(group_B, carla.TrafficLightState.Red)
+            last_green_phase[0] = 0
+            last_green_head[0] = ('A', best_idx)
     elif phase_idx == 1:
-        print(f"[SIGNAL] Phase 1: Setting {len(group_A)} group_A lights to YELLOW, {len(group_B)} group_B lights to RED")
-        for i, l in enumerate(group_A):
-            l.set_state(carla.TrafficLightState.Yellow)
-            print(f"  group_A[{i}] @ ({l.get_location().x:.1f}, {l.get_location().y:.1f}) → YELLOW")
-        for i, l in enumerate(group_B):
-            l.set_state(carla.TrafficLightState.Red)
-            print(f"  group_B[{i}] @ ({l.get_location().x:.1f}, {l.get_location().y:.1f}) → RED")
+        # Yellow only on the previously active movement.
+        active = last_green_head[0]
+        if active is None:
+            print("[SIGNAL] Phase 1: no active movement, holding RED")
+            _set_group_state(group_A, carla.TrafficLightState.Red)
+            _set_group_state(group_B, carla.TrafficLightState.Red)
+        else:
+            active_group, active_idx = active
+            if active_group == 'A':
+                print(f"[SIGNAL] Phase 1: group_A[{active_idx}] YELLOW transition, group_B RED")
+                for i, l in enumerate(group_A):
+                    l.set_state(carla.TrafficLightState.Yellow if i == active_idx else carla.TrafficLightState.Red)
+                _set_group_state(group_B, carla.TrafficLightState.Red)
+            else:
+                print(f"[SIGNAL] Phase 1: group_B[{active_idx}] YELLOW transition, group_A RED")
+                _set_group_state(group_A, carla.TrafficLightState.Red)
+                for i, l in enumerate(group_B):
+                    l.set_state(carla.TrafficLightState.Yellow if i == active_idx else carla.TrafficLightState.Red)
     else:  # phase_idx == 2 or other
-        print(f"[SIGNAL] Phase 2: Setting {len(group_A)} group_A lights to RED, {len(group_B)} group_B lights to GREEN")
-        for i, l in enumerate(group_A):
-            l.set_state(carla.TrafficLightState.Red)
-            print(f"  group_A[{i}] @ ({l.get_location().x:.1f}, {l.get_location().y:.1f}) → RED")
+        # Single active head in B group (highest-pressure arm), all others RED.
+        best_idx = 0
+        best_p = -1.0
         for i, l in enumerate(group_B):
-            l.set_state(carla.TrafficLightState.Green)
-            print(f"  group_B[{i}] @ ({l.get_location().x:.1f}, {l.get_location().y:.1f}) → GREEN")
+            p = _light_pressure(l)
+            if p > best_p:
+                best_p = p
+                best_idx = i
+        if best_p <= 0.05:
+            print("[SIGNAL] Phase 2: no demand in group_B, holding RED")
+            _set_group_state(group_A, carla.TrafficLightState.Red)
+            _set_group_state(group_B, carla.TrafficLightState.Red)
+            last_green_phase[0] = 2
+            last_green_head[0] = None
+        else:
+            print(f"[SIGNAL] Phase 2: Single GREEN in group_B[{best_idx}] (pressure={best_p:.2f}), others RED")
+            _set_group_state(group_A, carla.TrafficLightState.Red)
+            for i, l in enumerate(group_B):
+                st = carla.TrafficLightState.Green if i == best_idx else carla.TrafficLightState.Red
+                l.set_state(st)
+            last_green_phase[0] = 2
+            last_green_head[0] = ('B', best_idx)
 
 def set_all_red():
     """Set all signals to RED — used during pre-clearance phase."""
@@ -805,12 +916,16 @@ def verify_light_states():
     green_count = 0
     yellow_count = 0
     red_count = 0
+    green_a = 0
+    green_b = 0
     for i, l in enumerate(group_A):
         state = l.get_state()
         state_name = "GREEN" if state == carla.TrafficLightState.Green else \
                      "YELLOW" if state == carla.TrafficLightState.Yellow else "RED"
         print(f"  group_A[{i}] @ ({l.get_location().x:.1f}, {l.get_location().y:.1f}): {state_name}")
-        if state == carla.TrafficLightState.Green: green_count += 1
+        if state == carla.TrafficLightState.Green:
+            green_count += 1
+            green_a += 1
         elif state == carla.TrafficLightState.Yellow: yellow_count += 1
         else: red_count += 1
     for i, l in enumerate(group_B):
@@ -818,13 +933,20 @@ def verify_light_states():
         state_name = "GREEN" if state == carla.TrafficLightState.Green else \
                      "YELLOW" if state == carla.TrafficLightState.Yellow else "RED"
         print(f"  group_B[{i}] @ ({l.get_location().x:.1f}, {l.get_location().y:.1f}): {state_name}")
-        if state == carla.TrafficLightState.Green: green_count += 1
+        if state == carla.TrafficLightState.Green:
+            green_count += 1
+            green_b += 1
         elif state == carla.TrafficLightState.Yellow: yellow_count += 1
         else: red_count += 1
     print(f"[DEBUG] Total: {green_count} GREEN, {yellow_count} YELLOW, {red_count} RED")
-    if green_count > 2:
-        print(f"[ALERT] WARNING! {green_count} lights are GREEN simultaneously! Expected at most 2-4 total")
+    if green_a > 0 and green_b > 0:
+        print(f"[ALERT] WARNING! Both groups have GREEN (A={green_a}, B={green_b})")
+    if green_count > 1:
+        print(f"[ALERT] WARNING! More than one GREEN head active ({green_count})")
     return green_count, yellow_count, red_count
+
+# Apply startup phase using single-head selection logic to avoid 2-green startup.
+set_phase(initial_green_phase)
 
 def set_signals_for_emergency(emg_vehicles):
     """
@@ -851,22 +973,68 @@ def set_signals_for_emergency(emg_vehicles):
 
     priority_arm = 'A' if diff < 45 else 'B'
 
-    for l in group_A:
-        l.set_state(carla.TrafficLightState.Green if priority_arm == 'A'
-                    else carla.TrafficLightState.Red)
-    for l in group_B:
-        l.set_state(carla.TrafficLightState.Green if priority_arm == 'B'
-                    else carla.TrafficLightState.Red)
+    # Keep exactly one GREEN head during emergency.
+    if priority_arm == 'A':
+        best_idx = 0
+        best_dist = float('inf')
+        for i, l in enumerate(group_A):
+            d = l.get_location().distance(loc)
+            if d < best_dist:
+                best_dist = d
+                best_idx = i
+        for i, l in enumerate(group_A):
+            l.set_state(carla.TrafficLightState.Green if i == best_idx else carla.TrafficLightState.Red)
+        for l in group_B:
+            l.set_state(carla.TrafficLightState.Red)
+    else:
+        best_idx = 0
+        best_dist = float('inf')
+        for i, l in enumerate(group_B):
+            d = l.get_location().distance(loc)
+            if d < best_dist:
+                best_dist = d
+                best_idx = i
+        for l in group_A:
+            l.set_state(carla.TrafficLightState.Red)
+        for i, l in enumerate(group_B):
+            l.set_state(carla.TrafficLightState.Green if i == best_idx else carla.TrafficLightState.Red)
     return priority_arm
 
 # ── Emergency spawner ──────────────────────────────────────────────────────
 emergency_vehicle = None
 
+def _safe_destroy_actor(actor, tracked_list=None):
+    """Best-effort destroy that avoids CARLA 'actor not found' teardown noise."""
+    if actor is None:
+        return False
+    try:
+        if not actor.is_alive:
+            return False
+    except RuntimeError:
+        return False
+
+    try:
+        if world.get_actor(actor.id) is None:
+            return False
+    except RuntimeError:
+        return False
+
+    try:
+        actor.destroy()
+        if tracked_list is not None:
+            try:
+                tracked_list.remove(actor)
+            except ValueError:
+                pass
+        return True
+    except RuntimeError:
+        return False
+
 def _clear_spawn_point(sp, radius=5.0):
     """Destroy any vehicle blocking a spawn point so the spot is free."""
     for other in world.get_actors().filter("vehicle.*"):
         if other.is_alive and other.get_location().distance(sp.location) < radius:
-            other.destroy()
+            _safe_destroy_actor(other, tracked_list=vehicles)
 
 def spawn_emergency():
     """
@@ -874,9 +1042,9 @@ def spawn_emergency():
     immediately visible in BOTH CAM 1 (20 m back) and CAM 2 (55 m overhead).
     Blueprint priority: ambulance → firetruck → police → any 4-wheel vehicle.
 
-    Strategy (most-reliable first):
+        Strategy (most-reliable first):
       1. Use pre-cached approach-arm candidates, clearing any blocking vehicle first.
-      2. Widen to 20–180 m on the same approach arm, clearing blockers.
+            2. Widen to 30–75 m on the same approach arm, clearing blockers.
       3. Global last resort across all map spawn points.
     """
     lib = world.get_blueprint_library()
@@ -908,12 +1076,12 @@ def spawn_emergency():
         if v:
             break
 
-    # ── SECONDARY: widen to 20–180 m, same approach direction ────────────
+    # ── SECONDARY: widen slightly but stay within overview camera footprint ─
     if not v:
         all_sps = world.get_map().get_spawn_points()
-        # Sort farthest-first so vehicle enters from a visible distance
+        # Sort farthest-first while still visible in CAM 2.
         arm_sps = sorted(
-            [sp for sp in all_sps if 20 < sp.location.distance(center) < 180],
+            [sp for sp in all_sps if 30 < sp.location.distance(center) < 75],
             key=lambda sp: sp.location.distance(center), reverse=True
         )
         for sp in arm_sps:
@@ -922,11 +1090,11 @@ def spawn_emergency():
             if v:
                 break
 
-    # ── LAST RESORT: any map spawn point ─────────────────────────────────
+    # ── LAST RESORT: fallback candidates near intersection for visibility ─
     if not v:
-        all_sps = world.get_map().get_spawn_points()
-        random.shuffle(all_sps)
-        for sp in all_sps:
+        fallback_sps = list(_approach_spawn_candidates)
+        random.shuffle(fallback_sps)
+        for sp in fallback_sps:
             _clear_spawn_point(sp)
             v = _try_spawn(sp)
             if v:
@@ -973,7 +1141,7 @@ def spawn_emergency():
         dx2, dy2 = o_loc.x - emg_loc.x, o_loc.y - emg_loc.y
         dot = dx2 * emg_fwd.x + dy2 * emg_fwd.y
         if dot > 0:    # only vehicles ahead
-            other.destroy()
+            _safe_destroy_actor(other, tracked_list=vehicles)
 
     return v
 
@@ -998,11 +1166,11 @@ def draw_dashboard(phases, yolo_counts, stats_list, system_mode,
                 (8, 46), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (100, 100, 160), 1)
     cv2.line(panel, (0, 54), (W, 54), (60, 60, 100), 1)
 
-    # ── Camera legend ─────────────────────────────────────────────────────
+    # ── Sensing / view legend ─────────────────────────────────────────────
     cv2.rectangle(panel, (4, 58), (W-4, 100), (22, 22, 40), -1)
-    cv2.circle(panel,  (14, 70), 5, (0, 180, 255), -1)
-    cv2.putText(panel, "CAM 1  Road Approach (YOLO + Detection)",
-                (24, 74), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 180, 255), 1)
+    cv2.circle(panel,  (14, 70), 5, (0, 220, 130), -1)
+    cv2.putText(panel, "CONTROL INPUT: Ground Sensors (N/S/E/W)",
+                (24, 74), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 220, 130), 1)
     cv2.circle(panel,  (14, 88), 5, (180, 255, 100), -1)
     cv2.putText(panel, "CAM 2  Intersection Overview (Flow)",
                 (24, 92), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 255, 100), 1)
@@ -1051,7 +1219,7 @@ def draw_dashboard(phases, yolo_counts, stats_list, system_mode,
     tp = stats.get('throughput_vpm', 0.0)
     aw_col = (0, 70, 220) if aw > 15 else (0, 200, 100)
     for ri, (lbl, val, col) in enumerate([
-        ("Vehicles (YOLO)",  f"{yc}",              (180, 180, 180)),
+        ("Vehicles (Sensors)",  f"{yc}",              (180, 180, 180)),
         ("Queue Length",     f"{q}",               (180, 180, 180)),
         ("Avg Wait",         f"{aw:.1f} s",         aw_col),
         ("Throughput",       f"{tp:.1f} vpm",      (150, 220, 150)),
@@ -1073,9 +1241,9 @@ def draw_dashboard(phases, yolo_counts, stats_list, system_mode,
     cv2.putText(panel, "QUEUE", (bx1-52, by+10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.33, (80, 80, 100), 1)
 
-    # ── YOLO confidence bar ───────────────────────────────────────────────
+    # ── Sensor confidence bar ─────────────────────────────────────────────
     conf_col = (0,200,80) if yolo_conf > 0.5 else (0,180,220) if yolo_conf > 0.35 else (0,60,220)
-    cv2.putText(panel, f"YOLO Conf: {yolo_conf:.2f}",
+    cv2.putText(panel, f"Sensor Conf: {yolo_conf:.2f}",
                 (10, sy+280), cv2.FONT_HERSHEY_SIMPLEX, 0.41, conf_col, 1)
     bar_w = int((W-28) * max(0.0, min(1.0, yolo_conf)))
     cv2.rectangle(panel, (10, sy+284), (W-18, sy+293), (40, 40, 55), -1)
@@ -1179,18 +1347,16 @@ def draw_dashboard(phases, yolo_counts, stats_list, system_mode,
     return panel
 
 # ── Display window ─────────────────────────────────────────────────────────
-WIN_NAME = "Traffic Intelligence System  |  CAM 1: Perception  |  CAM 2: System Response  |  Q = quit"
+WIN_NAME = "Traffic Intelligence System  |  CAM 2: Intersection Overview  |  Q = quit"
 cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
-cv2.resizeWindow(WIN_NAME, 760 * 2 + DASH_W, 760)  # Road | Overview | Dashboard
+cv2.resizeWindow(WIN_NAME, 760 + DASH_W, 760)  # Overview | Dashboard
 
 # ── Main loop ──────────────────────────────────────────────────────────────
 print(f"\nDemo running.")
-print(f"  CAM 1 (Detection / Approach): {road_loc.distance(center):.0f} m before intersection, "
-      f"height +6 m, pitch -5°, faces oncoming traffic, YOLO + emergency at {ROAD_DETECTION_DIST} m")
 print(f"  CAM 2 (Intersection / Overview): above centre, height 30 m, pitch -90° (true top-down), "
       f"yaw=0 (axis-aligned '+'), live flow + signal dots")
-print(f"  Left view  = Perception (decision input)")
-print(f"  Right view = System Response (output / flow)")
+print(f"  Control input = Ground sensors (N/S/E/W per arm)")
+print(f"  Display = CAM 2 overview + dashboard")
 print(f"  Press Q to quit.\n")
 
 YOLO_INTERVAL      = 3
@@ -1203,13 +1369,16 @@ emg_counter    = EMERGENCY_INTERVAL
 emg_age        = 0
 emg_post_gap   = 0
 emg_stuck_ticks = 0   # consecutive ticks the emergency vehicle was near-stationary
-road_frame     = None   # latest annotated road-camera frame
 overview_frame = None   # latest annotated overview frame
 wait_history   = [[] for _ in range(NUM_INT)]
 
 try:
     while True:
-        world.tick()
+        try:
+            world.tick()
+        except RuntimeError as e:
+            print(f"[WARN] Simulation tick failed: {e}")
+            break
         tick_count += 1
 
         # ── Emergency vehicle lifecycle ────────────────────────────────────
@@ -1244,7 +1413,7 @@ try:
                 emg_stuck_ticks = 0
             emg_age += 1
             if emg_age >= EMERGENCY_LIFETIME:
-                emergency_vehicle.destroy()
+                _safe_destroy_actor(emergency_vehicle, tracked_list=vehicles)
                 emergency_vehicle = None
                 emg_age      = 0
                 emg_counter  = 0
@@ -1263,6 +1432,15 @@ try:
         timestamp  = world.get_snapshot().timestamp.elapsed_seconds
         all_actors = list(world.get_actors().filter("vehicle.*"))
 
+        # Ground-sensor control input (decision backend).
+        emergency_inputs = ([emergency_vehicle]
+                    if emergency_vehicle is not None and emergency_vehicle.is_alive
+                    else [])
+        sensor_result = ground_sensor.update(all_actors, emergency_inputs)
+        latest_sensor_counts = dict(sensor_result['arm_counts'])
+        control_count = sum(sensor_result['arm_counts'].values())
+        control_conf = 0.95
+
         # ── Continuous vehicle replenishment ──────────────────────────────
         # Check every 200 ticks. If the nearby vehicle count has dropped
         # (emergency clear-path destroys up to 70 m of traffic), spawn fresh
@@ -1270,10 +1448,10 @@ try:
         if tick_count % 200 == 0:
             nearby = sum(1 for v in all_actors
                          if v.is_alive
-                         and v.get_location().distance(center) < 150
+                         and v.get_location().distance(center) < REPLENISH_RADIUS_M
                          and not is_emergency_vehicle(v))
-            if nearby < 55:   # keep enough traffic without blocking all spawn points
-                need    = 55 - nearby
+            if nearby < REPLENISH_TARGET:
+                need    = REPLENISH_TARGET - nearby
                 all_sps = world.get_map().get_spawn_points()
                 random.shuffle(all_sps)
                 added   = 0
@@ -1281,7 +1459,7 @@ try:
                     if added >= need:
                         break
                     d = sp.location.distance(center)
-                    if 30 < d < 150:
+                    if 30 < d < REPLENISH_RADIUS_M:
                         bp = random.choice(car_bps)
                         nv = world.try_spawn_actor(bp, sp)
                         if nv:
@@ -1291,6 +1469,11 @@ try:
 
         wait_trackers[0].update(all_actors, center, tick_count)
         gt_count, avg_speed = compute_gt(center)
+        _wt_stats = wait_trackers[0].get_stats()
+        latest_arm_stats = {
+            'arm_queues': dict(latest_sensor_counts),
+            'arm_avg_waits': dict(_wt_stats['arm_avg_waits']),
+        }
 
         # ── Simulated low-confidence window (Scenario 4 — FALLBACK demo) ──
         # Triggers periodically when in DQN mode to demonstrate the safety
@@ -1302,32 +1485,22 @@ try:
             _sim_lc_dur_ctr = 0
             _sim_lc_timer   = 0
             print(f"[DEMO] tick {tick_count}: Simulating sensor degradation — "
-                  f"YOLO confidence forced low for {SIM_LC_DURATION} ticks.")
+                  f"sensor confidence forced low for {SIM_LC_DURATION} ticks.")
         if _sim_lc_active:
             _sim_lc_dur_ctr += 1
             if _sim_lc_dur_ctr >= SIM_LC_DURATION:
                 _sim_lc_active  = False
                 _sim_lc_dur_ctr = 0
-        effective_yolo_conf = 0.10 if _sim_lc_active else yolo_conf
+        effective_control_conf = 0.10 if _sim_lc_active else control_conf
 
         # Update FallbackController every tick (pass emergency_flag=0 — emergency
         # is handled separately so confidence and emergency don't interfere).
-        fallback_mode = fallback_ctrl.update(effective_yolo_conf, yolo_counts[0], 0)
+        fallback_mode = fallback_ctrl.update(effective_control_conf, control_count, 0)
 
-        # ── YOLO + annotation every YOLO_INTERVAL ticks ───────────────────
+        # ── Refresh display frames at interval ─────────────────────────────
         if tick_count % YOLO_INTERVAL == 0:
-
-            # Road camera: YOLO detection frame
-            frame, cnt, conf = run_yolo_annotated(
-                phases[0], yolo_counts[0],
-                is_emergency=(system_mode == 'EMERGENCY'),
-                emg_vehicle=emergency_vehicle,
-                sim_low_conf=_sim_lc_active
-            )
-            if frame is not None:
-                road_frame     = frame
-                yolo_counts[0] = cnt
-                yolo_conf      = conf   # update from real YOLO result
+            yolo_counts[0] = control_count
+            yolo_conf = effective_control_conf
 
             # Overview camera: intersection flow frame
             ov = draw_overview_annotated(
@@ -1361,6 +1534,7 @@ try:
                       f"({', '.join(names)}) — grace period ({GRACE_TICKS} ticks).")
                 system_mode          = 'GRACE'
                 grace_counter        = GRACE_TICKS
+                emergency_crossed_center = False
                 emergency_event_count += 1
             elif fallback_mode == ControlMode.FIXED_TIME:
                 # SCENARIO 4: FALLBACK — low YOLO confidence
@@ -1371,10 +1545,11 @@ try:
                 phase_durations[0]   = 600   # 30 s per phase
                 set_phase(phases[0])
                 print(f"[FALLBACK] tick {tick_count}: Low confidence "
-                      f"({effective_yolo_conf:.2f}) — entering FIXED-TIME mode.")
+                        f"({effective_control_conf:.2f}) — entering FIXED-TIME mode.")
             else:
                 # Normal DQN control (3-phase for demo)
                 arm_stats = wait_trackers[0].get_stats()
+                arm_stats['arm_queues'] = dict(latest_sensor_counts)
                 state = build_state(
                     arm_n_queue     = arm_stats['arm_queues']['N'],
                     arm_s_queue     = arm_stats['arm_queues']['S'],
@@ -1390,13 +1565,103 @@ try:
                     elapsed_seconds = timestamp
                 )
                 action = agents[0].act(state)
-                counters[0] += 1
-                if counters[0] >= phase_durations[0]:
-                    counters[0] = 0
-                    phases[0]   = (phases[0] + 1) % len(phase_states)
-                    phase_durations[0] = 20 if phases[0] == 1 else (
-                        120 if arm_stats['queue_length'] >= 8 else 80)
-                    set_phase(phases[0])
+
+                # Map DQN 4-action output to the two movement groups in demo mode.
+                desired_phase = 0 if action in (0, 1) else 2
+                best_phase = _pick_best_green_phase(arm_stats, default_phase=desired_phase)
+
+                # Complete yellow transition to pending green.
+                if phases[0] == 1:
+                    counters[0] += 1
+                    if counters[0] >= phase_durations[0]:
+                        phases[0] = pending_green_phase[0]
+                        counters[0] = 0
+                        phase_durations[0] = 100
+                        set_phase(phases[0])
+                else:
+                    counters[0] += 1
+                    current_pressure = _phase_pressure(arm_stats, phases[0])
+                    desired_pressure = _phase_pressure(arm_stats, desired_phase)
+                    best_pressure = _phase_pressure(arm_stats, best_phase)
+                    ns_demand, ew_demand = _axis_demands(arm_stats)
+
+                    if phases[0] == 0:
+                        ns_starve_ticks = 0
+                        ew_starve_ticks = ew_starve_ticks + 1 if ew_demand > DEMAND_EPS else 0
+                    else:  # phases[0] == 2
+                        ew_starve_ticks = 0
+                        ns_starve_ticks = ns_starve_ticks + 1 if ns_demand > DEMAND_EPS else 0
+
+                    # If agent picks a weak phase while another is clearly busier,
+                    # bias toward the busier arm for demo clarity and fairness.
+                    if best_pressure > DEMAND_EPS and desired_pressure < best_pressure * 0.75:
+                        desired_phase = best_phase
+                        desired_pressure = best_pressure
+
+                    # If neither arm has demand, keep one stable green (avoid long all-red).
+                    if current_pressure <= DEMAND_EPS and desired_pressure <= DEMAND_EPS:
+                        hold_phase = phases[0] if phases[0] in (0, 2) else last_green_phase[0]
+                        if hold_phase not in (0, 2):
+                            hold_phase = 0
+                        if phases[0] != hold_phase:
+                            phases[0] = hold_phase
+                            set_phase(phases[0])
+                        counters[0] = 0
+                        phase_durations[0] = 60
+                        continue
+
+                    # If the current arm is empty, do not keep serving it.
+                    if current_pressure <= DEMAND_EPS and desired_pressure > DEMAND_EPS:
+                        phases[0] = desired_phase
+                        counters[0] = 0
+                        phase_durations[0] = 100
+                        set_phase(desired_phase)
+                        continue
+
+                    # Adaptive green cap: don't over-hold any one side.
+                    if current_pressure < 1.0:
+                        max_green = 30
+                    elif current_pressure < 4.0:
+                        max_green = 60
+                    elif current_pressure < 8.0:
+                        max_green = 90
+                    else:
+                        max_green = 130
+
+                    min_green = 18 if current_pressure < 2.0 else 32
+                    should_switch = False
+
+                    # Anti-starvation: force service if an axis waits too long with demand.
+                    if ew_starve_ticks >= 60 and ew_demand > DEMAND_EPS and counters[0] >= 12:
+                        desired_phase = 2
+                        desired_pressure = ew_demand
+                        should_switch = True
+                    elif ns_starve_ticks >= 60 and ns_demand > DEMAND_EPS and counters[0] >= 12:
+                        desired_phase = 0
+                        desired_pressure = ns_demand
+                        should_switch = True
+
+                    if (best_phase != phases[0] and
+                            best_pressure > max(DEMAND_EPS, current_pressure * 1.20) and
+                            counters[0] >= 12):
+                        desired_phase = best_phase
+                        should_switch = True
+
+                    if desired_pressure > DEMAND_EPS and desired_phase != phases[0] and counters[0] >= min_green:
+                        if desired_pressure > current_pressure * 1.05 or current_pressure < 1.0:
+                            should_switch = True
+
+                    if counters[0] >= max_green and desired_pressure > DEMAND_EPS:
+                        should_switch = True
+                        if desired_phase == phases[0]:
+                            desired_phase = 2 if phases[0] == 0 else 0
+
+                    if should_switch:
+                        pending_green_phase[0] = desired_phase
+                        phases[0] = 1
+                        counters[0] = 0
+                        phase_durations[0] = 18
+                        set_phase(1)
 
         elif system_mode == 'FALLBACK':
             # ── SCENARIO 4: FALLBACK — fixed 30s cycle, safety fallback ───
@@ -1407,12 +1672,13 @@ try:
                       f"{', '.join(names)} detected.")
                 system_mode          = 'GRACE'
                 grace_counter        = GRACE_TICKS
+                emergency_crossed_center = False
                 emergency_event_count += 1
             elif fallback_mode == ControlMode.DQN:
                 # Confidence recovered — resume DQN
                 system_mode = 'DQN'
                 print(f"[FALLBACK→DQN] tick {tick_count}: "
-                      f"Confidence recovered ({effective_yolo_conf:.2f}) — "
+                        f"Confidence recovered ({effective_control_conf:.2f}) — "
                       f"resuming RL control.")
             else:
                 # Fixed-time cycling: 30 s green A, 30 s green B
@@ -1462,6 +1728,7 @@ try:
                         print(f"[EMERGENCY] Speed {emg_speed:.1f} m/s — "
                               f"extending GREEN to {emergency_timeout} ticks.")
                     arm = set_signals_for_emergency(emg_vehicles)
+                    emergency_crossed_center = False
                     phases[0] = 0 if arm == 'A' else 2
                     counters[0] = 0
                     phase_durations[0] = 9999
@@ -1474,8 +1741,19 @@ try:
 
         elif system_mode == 'EMERGENCY':
             # ── SCENARIO 2: EMERGENCY — hold GREEN for ambulance ──────────
-            if emg_vehicles:
-                arm = set_signals_for_emergency(emg_vehicles)
+            tracked_emg = emergency_vehicle if (emergency_vehicle and emergency_vehicle.is_alive) else None
+            priority_emg = emg_vehicles
+            if (not priority_emg and tracked_emg is not None and
+                    tracked_emg.get_location().distance(center) <= ROAD_DETECTION_DIST + 35):
+                priority_emg = [tracked_emg]
+
+            if priority_emg:
+                closest = min(priority_emg,
+                              key=lambda v: v.get_location().distance(center))
+                if closest.get_location().distance(center) < 12.0:
+                    emergency_crossed_center = True
+
+                arm = set_signals_for_emergency(priority_emg)
                 phases[0] = 0 if arm == 'A' else 2
                 counters[0] = 0
                 phase_durations[0] = 9999
@@ -1487,6 +1765,15 @@ try:
                     set_phase(2)
                     print(f"[EMERGENCY→RECOVERY] Timeout — resuming fixed cycle.")
             else:
+                # If center crossing has not been observed yet, tolerate short dropouts.
+                if not emergency_crossed_center and emergency_timeout > 0:
+                    emergency_timeout -= 1
+                    if tracked_emg is not None:
+                        arm = set_signals_for_emergency([tracked_emg])
+                        phases[0] = 0 if arm == 'A' else 2
+                        counters[0] = 0
+                        phase_durations[0] = 9999
+                    continue
                 print(f"[EMERGENCY] Cleared at tick {tick_count}. "
                       f"RECOVERY for {RECOVERY_TICKS} ticks.")
                 system_mode = 'RECOVERY'
@@ -1514,15 +1801,15 @@ try:
         else:
             stop_siren()
 
-        # ── Render — Road | Overview | Dashboard ──────────────────────────
-        if road_frame is not None and overview_frame is not None:
+        # ── Render — Overview | Dashboard ──────────────────────────────────
+        if overview_frame is not None:
             stats_now = [wait_trackers[0].get_stats()]
             dash = draw_dashboard(phases, yolo_counts, stats_now,
                                   system_mode, wait_history, tick_count,
-                                  yolo_conf=effective_yolo_conf,
+                                  yolo_conf=effective_control_conf,
                                   emg_count=emergency_event_count,
                                   fb_count=fallback_event_count)
-            cv2.imshow(WIN_NAME, np.hstack([road_frame, overview_frame, dash]))
+            cv2.imshow(WIN_NAME, np.hstack([overview_frame, dash]))
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
@@ -1533,11 +1820,16 @@ except KeyboardInterrupt:
 finally:
     cv2.destroyAllWindows()
     for cam in cameras:
-        cam.stop(); cam.destroy()
+        try:
+            cam.stop(); cam.destroy()
+        except RuntimeError:
+            pass
     for v in vehicles:
-        if v.is_alive: v.destroy()
-    if emergency_vehicle and emergency_vehicle.is_alive:
-        emergency_vehicle.destroy()
+        _safe_destroy_actor(v)
+    _safe_destroy_actor(emergency_vehicle)
     settings.synchronous_mode = False
-    world.apply_settings(settings)
+    try:
+        world.apply_settings(settings)
+    except RuntimeError as e:
+        print(f"[WARN] Could not apply async settings on shutdown: {e}")
     print("Demo ended.")

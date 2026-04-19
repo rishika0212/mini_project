@@ -1,165 +1,157 @@
-# YOLOv8 + Deep Q-Network Based Adaptive Traffic Signal Control
-### with Emergency Vehicle Prioritization Using CARLA Simulation
+# Traffic Intelligence System for CARLA
 
-**Dayananda Sagar College of Engineering**
-Department of Robotics and Artificial Intelligence — 22RI66 Mini Project II
+**Hybrid Architecture**: Realistic ground sensors backend + overhead camera visualization
 
----
+## 🚀 Quick Start
 
-## Project Overview
-
-A vision-driven adaptive traffic signal control system that:
-- Detects vehicles in real time using **YOLOv8n** from overhead RGB cameras
-- Controls traffic signals intelligently using a **Deep Q-Network (DQN)** agent
-- Prioritizes **emergency vehicles** (ambulance, fire truck) automatically
-- Falls back to **fixed-time control** when camera confidence drops below threshold
-- Simulated in **CARLA v0.9.x** across 3 intersections simultaneously
-
-### Key Results (30-episode evaluation)
-| Metric | DQN Agent | Fixed-Time | Random |
-|--------|-----------|------------|--------|
-| Avg Waiting Time | **7.15s** | 8.82s | 10.16s |
-| Throughput (veh/min) | **14.24** | 6.03 | 4.10 |
-| Avg Speed (m/s) | **2.01** | 0.94 | 0.65 |
-| vs Fixed-Time | **18.9% better** | baseline | — |
-
----
-
-## Project Structure
-
-```
-Traffic_project/
-├── main.py                 # Full integrated system entrypoint
-├── dqn_agent.py            # DQN neural network + training logic
-├── waiting_time.py         # Per-vehicle waiting time tracker
-├── fallback.py             # Safety fallback controller
-├── evaluate.py             # Policy evaluation (DQN vs Fixed vs Random)
-├── collect_dataset.py      # CARLA dataset collection for YOLO training
-├── train_yolo.py           # Fine-tune YOLOv8 on CARLA data
-├── demo.py                 # Live visual demo
-├── yolov8n.pt              # Base YOLO model
-├── data/
-│   ├── dqn_weights_int1.json
-│   ├── dqn_weights_int2.json
-│   ├── dqn_weights_int3.json
-│   ├── rl_states.csv
-│   └── snapshots/
-└── dataset/                # Created by collect_dataset.py
-```
-
----
-
-## Setup
-
-### Requirements
-- Python 3.8+
-- CARLA 0.9.x
-- NVIDIA GPU (recommended)
-
-### Install dependencies
 ```bash
-pip install ultralytics opencv-python numpy matplotlib pyyaml
-```
+# Terminal 1: Start CARLA
+CarlaUE4.exe /Game/Carla/Maps/Town03
 
----
-
-## How to Run
-
-### 1. Start CARLA
-```bash
-CarlaUE4.exe -quality-level=Low
-```
-
-### 2. Run the full system (evaluation mode)
-```bash
-python main.py
-```
-
-### 3. Run with training mode
-```bash
-python main.py --train
-```
-
-### 4. Collect YOLO training data
-```bash
-python collect_dataset.py
-```
-
-### 5. Fine-tune YOLO on your data
-```bash
-python train_yolo.py
-```
-
-### 6. Use custom YOLO model
-```bash
-python main.py --model vehicle_detector.pt
-```
-
-### 7. Evaluate policies
-```bash
-python evaluate.py --policy dqn
-python evaluate.py --policy fixed
-python evaluate.py --policy random
-```
-
-### 8. Run live demo
-```bash
+# Terminal 2: Run demo
 python demo.py
 ```
 
+**5 minutes later** → See overhead camera + emergency RED boxes + DQN control
+
 ---
 
-## System Architecture
+## 📁 Project Structure
 
 ```
-CARLA Simulation
-      │
-      ▼
-RGB Camera (640×640, 90° FOV, 12m height, -45° pitch)
-      │
-      ▼
-YOLOv8n Detection (conf threshold: 0.25)
-      │
-      ├─── Confidence ≥ 0.35 ──→ DQN Agent ──→ Signal Decision
-      │                               │
-      │                    State: [yolo_count, gt_count,
-      │                            avg_speed, phase,
-      │                            phase_timer, time_of_day,
-      │                            emergency_flag]
-      │
-      ├─── Confidence < 0.35 ──→ Fixed-Time Fallback (30s/phase)
-      │
-      └─── Emergency detected ─→ Force Green (immediate)
+.
+├── *.py                          # Python scripts (14 files)
+│   ├── demo.py                   # Interactive demo (overhead camera)
+│   ├── main.py                   # Full system with ground sensors
+│   ├── train_orchestrator.py     # Auto 2-phase training
+│   ├── evaluate.py               # Compare policies (DQN vs Fixed vs Random)
+│   ├── plot_results.py           # Generate comparison charts
+│   ├── dqn_agent.py              # Intelligent control
+│   ├── ground_sensors.py         # Realistic per-arm detection
+│   ├── fallback.py               # Confidence-based fallback
+│   ├── waiting_time.py           # Queue tracking
+│   ├── test_all_scenarios.py     # Validate system
+│   └── [others]
+│
+├── data/                         # Training & results (auto-created)
+│   ├── dqn_weights_int1.json     # Trained agent weights
+│   ├── eval_*.csv                # Evaluation metrics
+│   └── plots/                    # Generated charts
+│
+└── docs/                         # ALL INSTRUCTIONS (organized here!)
+    ├── README.md                 # Main documentation
+    ├── COMMANDS.md               # Copy-paste commands
+    ├── QUICK_START.md            # 5-minute guide
+    ├── WORKFLOW_GUIDE.md         # Detailed workflows
+    ├── HYBRID_SYSTEM_COMPLETE.md # Architecture overview
+    ├── TRAINING_GUIDE.md         # Training instructions
+    ├── TROUBLESHOOTING_DEMO.md   # If something breaks
+    ├── VIVA_REFERENCE.md         # Presentation notes
+    └── [11 other guides]
 ```
 
 ---
 
-## DQN Architecture
+## 📚 Documentation Guide
 
-- **State space**: 7 features (normalized)
-- **Action space**: 2 actions (keep phase / switch phase)
-- **Network**: 7 → 32 → 32 → 2 (ReLU, numpy implementation)
-- **Training**: Experience replay (buffer: 10,000), epsilon-greedy (ε: 1.0→0.1)
-- **Episodes trained**: 114
+Start with these (in order):
 
----
+1. **`docs/COMMANDS.md`** ← Quick copy-paste reference
+2. **`docs/QUICK_START.md`** ← 5-minute getting started
+3. **`docs/WORKFLOW_GUIDE.md`** ← Detailed instructions for each command
+4. **`docs/HYBRID_SYSTEM_COMPLETE.md`** ← Architecture explanation
 
-## Team
-
-| Name | USN |
-|------|-----|
-| Dhruv Khanna | 1DS23RI018 |
-| Rishika | 1DS23RI040 |
-| Saurav Kumar | IDS23RI045 |
-| Yajat Kanaskar | IDS23RI060 |
-
-**Guide**: Nishchitha M H, Assistant Professor, Robotics and AI
+For specific needs:
+- **Training?** → `docs/TRAINING_GUIDE.md`
+- **Issues?** → `docs/TROUBLESHOOTING_DEMO.md`
+- **Presentation?** → `docs/VIVA_REFERENCE.md`
+- **Full project story?** → `docs/PROJECT_END_TO_END_NARRATIVE.md`
 
 ---
 
-## References
+## 🎯 Most Used Commands
 
-1. Azfar et al. (2025) — Traffic Co-Simulation with CARLA + SUMO + RL
-2. Li et al. (2021) — Deep RL for Traffic Signal Control, IEEE Access
-3. Shankaran & Rajendran (2021) — Camera-Based Adaptive Traffic Control
-4. VLMLight (2024) — Vision-Language Traffic Signal Control
+```bash
+# See it working (5 min)
+python demo.py
+
+# Train agent (3-4 hours)
+python train_orchestrator.py
+
+# Evaluate & compare (45 min)
+python evaluate.py --policy dqn --episodes 30
+python evaluate.py --policy fixed --episodes 30
+python plot_results.py
+
+# Validate system
+python test_all_scenarios.py
+```
+
+---
+
+## ✨ Key Features
+
+✅ **Realistic Ground Sensors** - Per-arm vehicle detection (N/S/E/W)
+✅ **Overhead Camera** - Clean bird's-eye view visualization
+✅ **Emergency Vehicles** - RED boxes on camera for ambulances
+✅ **Adaptive Control** - DQN learns optimal phase timing
+✅ **Safe Fallback** - Fixed-time mode when confidence drops
+✅ **Multiple Policies** - Compare DQN vs Fixed vs Random
+✅ **Full Logging** - CSV metrics + console output + visualization
+
+---
+
+## 🔄 Typical Workflow
+
+```
+demo.py (5 min)
+    ↓
+train_orchestrator.py (3-4 hours)
+    ↓
+evaluate.py --policy dqn (15 min)
+evaluate.py --policy fixed (15 min)
+    ↓
+plot_results.py (1 min)
+    ↓
+View comparison charts in data/plots/
+```
+
+---
+
+## 📊 System Modes
+
+| Mode | Triggered | Behavior |
+|------|-----------|----------|
+| **RL (DQN)** | Normal | Intelligent adaptive control |
+| **FALLBACK** | Conf < 0.35 | Safe fixed 30-30-5 cycling |
+| **EMERGENCY** | Ambulance | Priority GREEN for ambulance arm |
+| **RECOVERY** | Post-emergency | Fixed-time drainage (10s) |
+
+---
+
+## 🎓 Next Steps
+
+1. **Read**: `docs/QUICK_START.md`
+2. **Run**: `python demo.py`
+3. **Train**: `python train_orchestrator.py`
+4. **Evaluate**: `python evaluate.py --policy dqn --episodes 30`
+5. **Plot**: `python plot_results.py`
+
+---
+
+## 📞 Need Help?
+
+- **Getting started?** → `docs/QUICK_START.md`
+- **Commands?** → `docs/COMMANDS.md`
+- **Workflows?** → `docs/WORKFLOW_GUIDE.md`
+- **Something broken?** → `docs/TROUBLESHOOTING_DEMO.md`
+- **Signal control issues?** → `docs/SIGNAL_DEBUG_GUIDE.md` + `docs/QUICK_FIX_GUIDE.md`
+- **Want details?** → `docs/HYBRID_SYSTEM_COMPLETE.md` + `docs/SIGNAL_CONTROL_DETAILED.md`
+
+All guides are in the `docs/` folder for easy organization!
+
+---
+
+**Status**: ✅ **READY TO USE**
+
+All instructions organized in `docs/` folder. Start with `docs/COMMANDS.md` for copy-paste commands.

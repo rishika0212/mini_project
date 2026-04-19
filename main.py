@@ -37,6 +37,7 @@ from dqn_agent    import DQNAgent, EpisodeTracker, build_state, compute_reward
 from waiting_time import IntersectionWaitingTimeTracker
 from fallback     import get_yolo_confidence
 from system_controller import TrafficSystemController, SystemMode
+from ground_sensors import IntersectionGroundSensors
 
 # ── Args ───────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
@@ -142,6 +143,22 @@ ROI_RADIUS    = 50
 wait_trackers = [IntersectionWaitingTimeTracker(i+1, ROI_RADIUS, intersection_centers[i])
                  for i in range(NUM_INT)]
 
+# ── Ground Sensors (inductive loops) ───────────────────────────────────────
+# Realistic per-arm vehicle detection
+ground_sensors = []
+for i, center in enumerate(intersection_centers):
+    # Estimate arm directions from light positions (NS and EW)
+    # For simplicity, use cardinal directions (N=0°, E=90°, S=180°, W=270°)
+    arm_directions = {
+        'N': 0,      # North
+        'S': 180,    # South
+        'E': 90,     # East
+        'W': 270,    # West
+    }
+    sensor = IntersectionGroundSensors(i+1, center, arm_directions)
+    ground_sensors.append(sensor)
+    print(f"  Ground sensors for Int {i+1}: N/S/E/W arms")
+
 # ── Vehicles ───────────────────────────────────────────────────────────────
 blueprints   = world.get_blueprint_library().filter("vehicle.*")
 car_bps      = [bp for bp in blueprints
@@ -177,9 +194,10 @@ camera_bp.set_attribute('sensor_tick','0.1')
 cameras, camera_int_map = [], []
 
 for i, center in enumerate(intersection_centers):
+    # Position camera at intersection center, overhead looking down
     transform = carla.Transform(
-        carla.Location(x=center.x-20, y=center.y, z=center.z+12),
-        carla.Rotation(pitch=-45, yaw=0)
+        carla.Location(x=center.x, y=center.y, z=center.z+30),  # 30m above intersection
+        carla.Rotation(pitch=-90, yaw=0)  # Looking straight down
     )
     cam = world.spawn_actor(camera_bp, transform)
     cameras.append(cam)
@@ -555,13 +573,20 @@ try:
         for idx, center in enumerate(intersection_centers):
             wait_trackers[idx].update(all_actors, center, tick_count)
 
-        # YOLO every 10 ticks (skip during training for speed)
-        if tick_count % YOLO_INTERVAL == 0 and not args.no_yolo:
-            for cam_i in range(len(cameras)):
-                cnt, conf, _ = run_yolo(cam_i, tick_count)
-                int_i        = camera_int_map[cam_i]
-                yolo_counts[int_i] = cnt
-                yolo_confs[int_i]  = conf
+        # Update ground sensors every tick (realistic detection)
+        # Use the currently tracked emergency vehicle for sensor emergency input.
+        emergency_actors = ([emergency_vehicle]
+                            if emergency_vehicle is not None and emergency_vehicle.is_alive
+                            else [])
+        for idx, sensor in enumerate(ground_sensors):
+            sensor_result = sensor.update(all_actors, emergency_actors)
+            yolo_counts[idx] = (
+                sensor_result['arm_counts']['N']
+                + sensor_result['arm_counts']['S']
+                + sensor_result['arm_counts']['E']
+                + sensor_result['arm_counts']['W']
+            )
+            yolo_confs[idx] = 0.95  # Ground sensors have high confidence
 
         # Per-intersection control
         for idx, center in enumerate(intersection_centers):
