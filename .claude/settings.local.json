@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(python -c ' *)",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('c:/CARLA/Traffic_project/demo.py', encoding='utf-8'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('c:/CARLA/Traffic_project/demo.py', encoding='utf-8'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('demo.py'\\).read\\(\\)\\); print\\('OK: demo.py'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('demo.py'\\).read\\(\\)\\); print\\('OK'\\)\")"
     ]
   }
 }

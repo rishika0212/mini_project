@@ -1,22 +1,25 @@
 """
 train_orchestrator.py
-==========================
-Automated two-phase training with real-time output:
-  Phase 1: 350 episodes WITHOUT emergencies (sparse traffic — 135 vehicles)
-  Phase 2: 150 episodes WITH emergencies (medium traffic — 350+ vehicles)
+=====================
+Two-phase training orchestrator for the demo.py single-arm DQN system.
 
-PERFORMANCE OPTIMIZATIONS:
-  • Vehicle spawning reduced for Phase 1 (sparse) → faster convergence
-  • YOLO disabled during training (--no-yolo) → 30-40% faster training
-  • YOLO GPU acceleration enabled for eval/demo
-  • Expected training time: 3-4 hours (vs 7+ hours previously)
+Phase 1 — Base policy (no emergencies, sparse traffic)
+  • 350 episodes
+  • 120 vehicles
+  • Emergencies disabled
+  • DQN learns basic pressure-based arm switching
 
-Vehicle density progression:
-  Phase 1: spawn_points[:60] + 25 per intersection = ~135 total (learnable)
-  Phase 2: spawn_points[:180] + 80 per intersection = ~420 total (challenging)
+Phase 2 — Emergency robustness (with emergencies, more traffic)
+  • 150 episodes (total 500)
+  • 220 vehicles
+  • Emergencies enabled every ~90 s
+  • DQN learns to handle emergency interruptions
+
+Weights are saved to data/dqn_weights_int1.json after each phase
+and loaded by demo.py automatically.
 
 Usage:
-  python train_orchestrator.py
+    python train_orchestrator.py
 """
 
 import subprocess
@@ -25,199 +28,186 @@ import time
 import re
 import os
 
-def modify_emergency_interval(interval_value):
-    """Modify EMERGENCY_INTERVAL in main.py"""
-    with open('main.py', 'r') as f:
-        content = f.read()
 
-    # Replace EMERGENCY_INTERVAL value
-    content = re.sub(
-        r'EMERGENCY_INTERVAL\s*=\s*\d+',
-        f'EMERGENCY_INTERVAL = {interval_value}',
-        content
-    )
+def run_phase(label, episodes, vehicles, no_emg, timeout_hours=3.0):
+    """
+    Run main.py --train with given parameters.
+    Streams output in real time.
+    Stops when target episode count is reached or timeout expires.
 
-    with open('main.py', 'w') as f:
-        f.write(content)
+    Returns True if target was reached, False otherwise.
+    """
+    print(f"\n{'='*65}")
+    print(f"  {label}")
+    print(f"  Episodes : {episodes}   Vehicles : {vehicles}   "
+          f"Emergency : {'OFF' if no_emg else 'ON'}")
+    print(f"  Expected time : up to {timeout_hours:.1f} hours")
+    print(f"{'='*65}\n")
+    time.sleep(2)
 
-    status = "DISABLED" if interval_value > 100000 else f"{interval_value} ticks (~{interval_value*0.05:.1f}s)"
-    print(f"\n{'='*70}")
-    print(f"  Emergencies: {status}")
-    print(f"{'='*70}\n")
-    time.sleep(1)
+    cmd = [
+        sys.executable, '-u', 'main.py',
+        '--train',
+        f'--episodes={episodes}',
+        f'--vehicles={vehicles}',
+    ]
+    if no_emg:
+        cmd.append('--no-emg')
 
-def modify_traffic_density(mode):
-    """Modify vehicle spawning density (Phase 1: sparse, Phase 2: medium)"""
-    with open('main.py', 'r') as f:
-        content = f.read()
-
-    if mode == "sparse":
-        # Phase 1: ~135 vehicles total
-        content = re.sub(
-            r"for sp in spawn_points\[:180\]:",
-            "for sp in spawn_points[:60]:",
-            content
-        )
-        content = re.sub(
-            r"(for sp in nearby:\s+if n >= )\d+:",
-            r"\g<1>25:",
-            content,
-            count=1  # Only replace first occurrence (vehicle spawning, not emergency)
-        )
-        content = re.sub(
-            r"RUSH_HOUR_INTERVAL\s*=\s*\d+",
-            "RUSH_HOUR_INTERVAL = 999999",
-            content
-        )
-        density_desc = "sparse (~135 vehicles)"
-    else:  # Phase 2
-        # Phase 2: ~420+ vehicles total (realistic city traffic)
-        content = re.sub(
-            r"for sp in spawn_points\[:60\]:",
-            "for sp in spawn_points[:180]:",
-            content
-        )
-        content = re.sub(
-            r"(for sp in nearby:\s+if n >= )\d+:",
-            r"\g<1>80:",
-            content,
-            count=1  # Only replace first occurrence
-        )
-        content = re.sub(
-            r"RUSH_HOUR_INTERVAL\s*=\s*\d+",
-            "RUSH_HOUR_INTERVAL = 1200",
-            content
-        )
-        density_desc = "medium (~420+ vehicles with rush hour)"
-
-    with open('main.py', 'w') as f:
-        f.write(content)
-
-    print(f"\n{'='*70}")
-    print(f"  Traffic density: {density_desc}")
-    print(f"{'='*70}\n")
-    time.sleep(1)
-
-def run_training(phase_name, target_episode):
-    """Run training until target episode is reached"""
-    print(f"\n{'='*70}")
-    print(f"  PHASE: {phase_name}")
-    print(f"  Target: Episode {target_episode}")
-    print(f"  Starting training... (this may take 30 seconds to connect to CARLA)")
-    print(f"{'='*70}\n")
-
-    # Use unbuffered Python output
     env = os.environ.copy()
     env['PYTHONUNBUFFERED'] = '1'
 
     process = subprocess.Popen(
-        [sys.executable, '-u', 'main.py', '--train', '--no-yolo'],
+        cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         universal_newlines=True,
-        bufsize=0,  # Unbuffered
-        env=env
+        bufsize=0,
+        env=env,
     )
 
-    episode_pattern = re.compile(r'Episode\s+(\d+)')
-    last_episode = 0
-    timeout_counter = 0
+    episode_re    = re.compile(r'Episode\s+(\d+)')
+    last_episode  = 0
+    reached       = False
+    deadline      = time.time() + timeout_hours * 3600
 
     try:
         for line in process.stdout:
-            # Print every line in real-time
-            print(line.rstrip())
-            sys.stdout.flush()
+            print(line, end='', flush=True)
 
-            # Check if we've reached target episode
-            match = episode_pattern.search(line)
-            if match:
-                current_ep = int(match.group(1))
-                if current_ep != last_episode:
-                    last_episode = current_ep
-                    timeout_counter = 0
+            m = episode_re.search(line)
+            if m:
+                ep = int(m.group(1))
+                if ep != last_episode:
+                    last_episode = ep
 
-                if current_ep >= target_episode:
-                    print(f"\n[ORCHESTRATOR] ✓ Target episode {target_episode} reached!")
-                    print(f"[ORCHESTRATOR] Stopping phase...")
+                if ep >= episodes:
+                    reached = True
+                    print(f"\n[ORCHESTRATOR] Target episode {episodes} reached — stopping phase.")
                     time.sleep(2)
                     process.terminate()
                     try:
-                        process.wait(timeout=5)
+                        process.wait(timeout=10)
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait()
                     return True
 
-            timeout_counter += 1
+            if time.time() > deadline:
+                print(f"\n[ORCHESTRATOR] Timeout after {timeout_hours:.1f} h — stopping phase.")
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                return False
 
     except KeyboardInterrupt:
-        print("\n\n[ORCHESTRATOR] ⚠ Training interrupted by user")
+        print("\n\n[ORCHESTRATOR] Interrupted by user.")
         process.terminate()
         process.wait()
         return False
-    except Exception as e:
-        print(f"\n[ORCHESTRATOR] ✗ Error: {e}")
+    except Exception as exc:
+        print(f"\n[ORCHESTRATOR] Error: {exc}")
         return False
 
-    return True
+    rc = process.wait()
+    if reached:
+        return True
+    print(f"[ORCHESTRATOR] Process exited (code={rc}) before episode {episodes}. "
+          f"Last seen: {last_episode}")
+    return False
+
+
+def check_weights():
+    path = "data/dqn_weights_int1.json"
+    if os.path.exists(path):
+        size_kb = os.path.getsize(path) / 1024
+        print(f"[ORCHESTRATOR] Weights found: {path} ({size_kb:.1f} KB)")
+    else:
+        print(f"[ORCHESTRATOR] No weights yet at {path} — fresh start.")
+
 
 def main():
-    print("\n" + "="*70)
+    print("\n" + "="*65)
     print("  TRAFFIC SIGNAL DQN — TWO-PHASE TRAINING ORCHESTRATOR")
-    print("="*70)
-    print("\n  Phase 1: Learn base 4-phase control (sparse traffic, NO emergencies)")
-    print("  Phase 2: Learn emergency robustness (medium traffic, WITH emergencies)")
-    print("\n  Estimated time: 4-5 hours (phase 1 should now converge)")
-    print("  Total: 500 episodes")
-    print("\n" + "="*70 + "\n")
+    print("  System: single-arm pressure+DQN (matches demo.py exactly)")
+    print("="*65)
+    print("""
+  Phase 1 : Learn basic arm switching (sparse, no emergencies)
+            350 episodes · 120 vehicles · ~2–3 hours
 
-    # ── PHASE 1: Base policy without emergencies ────────────────────────────
-    print("[ORCHESTRATOR] Starting PHASE 1...")
-    modify_traffic_density("sparse")
-    modify_emergency_interval(999999)  # Disable
-    success = run_training("PHASE 1: Base Policy (sparse traffic, 350 episodes)", 350)
+  Phase 2 : Learn emergency robustness (more traffic, emergencies on)
+            150 episodes · 220 vehicles · ~1–2 hours
 
-    if not success:
-        print("[ORCHESTRATOR] ✗ Phase 1 failed or interrupted")
-        return
+  Total   : 500 episodes · ~3–5 hours
 
-    print("\n[ORCHESTRATOR] ✓ Phase 1 complete!")
-    print("[ORCHESTRATOR] Weights saved at: data/dqn_weights_int*.json")
-    time.sleep(3)
+  Weights saved to: data/dqn_weights_int1.json
+  Load by demo.py automatically on next run.
 
-    # ── PHASE 2: Robustness with emergencies ────────────────────────────────
-    print("\n[ORCHESTRATOR] Starting PHASE 2...")
-    print("[ORCHESTRATOR] Increasing traffic density and enabling emergencies...")
-    modify_traffic_density("medium")
-    modify_emergency_interval(1500)  # Every 75 seconds
-    success = run_training("PHASE 2: Emergency Robustness (medium traffic, 150 eps, total 500)", 500)
+  Press Ctrl+C at any time to stop safely — weights are saved
+  at episode checkpoints (every 10 episodes) and on exit.
+""")
 
-    if not success:
-        print("[ORCHESTRATOR] ✗ Phase 2 failed or interrupted")
-        return
+    os.makedirs("data", exist_ok=True)
+    check_weights()
 
-    print("\n" + "="*70)
-    print("  ✓✓✓ TRAINING COMPLETE! ✓✓✓")
-    print("="*70)
-    print("\nTraining Summary:")
-    print("  • Phase 1: 350 episodes (sparse traffic, base policy)")
-    print("  • Phase 2: 150 episodes (medium traffic, emergency robustness)")
-    print("  • Total:   500 episodes")
-    print("\nOutput files:")
-    print("  • Weights: data/dqn_weights_int1.json")
-    print("  •          data/dqn_weights_int2.json")
-    print("  •          data/dqn_weights_int3.json")
-    print("  • Logs:    data/rl_states_final.csv")
-    print("\nNext steps:")
-    print("  1. Review results: data/rl_states_final.csv")
-    print("  2. Test policy:    python main.py")
-    print("  3. Visual demo:    python demo.py")
-    print("="*70 + "\n")
+    input("  Press ENTER to start training (make sure CARLA is running)...\n")
+
+    # ── Phase 1 ───────────────────────────────────────────────────────────
+    print("\n[ORCHESTRATOR] Starting PHASE 1 — base policy...")
+    ok = run_phase(
+        label         = "PHASE 1: Base policy — sparse traffic, no emergencies",
+        episodes      = 350,
+        vehicles      = 120,
+        no_emg        = True,
+        timeout_hours = 3.5,
+    )
+
+    if not ok:
+        print("\n[ORCHESTRATOR] Phase 1 did not complete cleanly.")
+        print("[ORCHESTRATOR] Weights up to the last checkpoint are still usable.")
+        ans = input("[ORCHESTRATOR] Continue to Phase 2 anyway? [y/N]: ").strip().lower()
+        if ans != 'y':
+            print("[ORCHESTRATOR] Stopping. Run demo.py to test what was trained.")
+            return
+
+    print("\n[ORCHESTRATOR] Phase 1 complete.")
+    check_weights()
+    print("[ORCHESTRATOR] Pausing 10 s before Phase 2...")
+    time.sleep(10)
+
+    # ── Phase 2 ───────────────────────────────────────────────────────────
+    print("\n[ORCHESTRATOR] Starting PHASE 2 — emergency robustness...")
+    ok = run_phase(
+        label         = "PHASE 2: Emergency robustness — medium traffic, emergencies enabled",
+        episodes      = 150,   # 150 new episodes; weights from Phase 1 are loaded automatically
+        vehicles      = 220,
+        no_emg        = False,
+        timeout_hours = 2.5,
+    )
+
+    if not ok:
+        print("\n[ORCHESTRATOR] Phase 2 did not complete cleanly.")
+        print("[ORCHESTRATOR] Weights up to the last checkpoint are still usable.")
+
+    # ── Summary ───────────────────────────────────────────────────────────
+    print("\n" + "="*65)
+    print("  TRAINING COMPLETE")
+    print("="*65)
+    check_weights()
+    print("""
+  Next steps:
+    1. Evaluate:   python evaluate.py
+    2. Plot:       python plot_results.py
+    3. Demo:       python demo.py
+""")
+
 
 if __name__ == '__main__':
     try:
         main()
     except KeyboardInterrupt:
-        print("\n\n[ORCHESTRATOR] Training aborted by user")
+        print("\n[ORCHESTRATOR] Aborted.")
         sys.exit(0)

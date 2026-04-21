@@ -8,35 +8,25 @@ import os
 # DEEP Q-NETWORK AGENT
 # ==============================
 
-# STATE (12 features):
-#   [0]  arm_N_queue  — vehicles waiting on North arm  (normalised)
-#   [1]  arm_S_queue  — vehicles waiting on South arm  (normalised)
-#   [2]  arm_E_queue  — vehicles waiting on East arm   (normalised)
-#   [3]  arm_W_queue  — vehicles waiting on West arm   (normalised)
-#   [4]  arm_N_wait   — avg wait time, North arm       (normalised)
-#   [5]  arm_S_wait   — avg wait time, South arm       (normalised)
-#   [6]  arm_E_wait   — avg wait time, East arm        (normalised)
-#   [7]  arm_W_wait   — avg wait time, West arm        (normalised)
-#   [8]  active_phase — current green phase 0-3        (normalised /3)
-#   [9]  phase_time   — ticks spent in current phase   (normalised)
-#   [10] time_of_day  — elapsed time modulo 10 min     (normalised)
-#   [11] emergency    — 1 if emergency vehicle in ROI
+# STATE (7 features):
+#   [0-3] pN, pS, pE, pW  — per-arm pressures, max-normalised to [0,1]
+#   [4]   current_arm      — index of green arm (0-3), normalised /3
+#   [5]   time_in_phase    — ticks in current green phase, normalised
+#   [6]   emergency_flag   — 1 if emergency vehicle in ROI
 
-# ACTION (4):
-#   0 = Phase 0 — NS Straight + Right  (N & S green, E & W red)
-#   1 = Phase 1 — NS Left turns        (N & S green protected left)
-#   2 = Phase 2 — EW Straight + Right  (E & W green, N & S red)
-#   3 = Phase 3 — EW Left turns        (E & W green protected left)
+# ACTION (2):
+#   0 = keep current phase (do not switch)
+#   1 = allow switch (rule-based controller may switch to best-pressure arm)
 #
-# DQN chooses the NEXT desired phase. Transition (yellow → all-red) is
-# hardcoded in main.py and not controlled by the agent.
+# DQN assists the pressure-based controller by deciding WHEN to switch,
+# not WHICH arm to switch to. The rule-based controller enforces all
+# safety invariants (min/max green time, pressure margin).
 
-STATE_SIZE  = 12
-ACTION_SIZE = 4   # choose next phase (0-3)
+STATE_SIZE  = 7
+ACTION_SIZE = 2   # 0=keep, 1=allow-switch
 
-MAX_VEHICLES = 30.0
-MAX_WAIT     = 120.0   # seconds — used to normalise waiting time
-MAX_DURATION = 600.0   # 30 s max green in ticks (600 ticks × 0.05 s)
+MAX_PRESSURE = 60.0   # normalisation ceiling for pressure values
+MAX_DURATION = 320.0  # MAX_GREEN_TICKS from controller.py
 
 
 class DQNAgent:
@@ -46,8 +36,8 @@ class DQNAgent:
                  learning_rate=0.001,
                  gamma=0.95,
                  epsilon=1.0,
-                 epsilon_min=0.1,
-                 epsilon_decay=0.995,
+                 epsilon_min=0.05,
+                 epsilon_decay=0.9995,
                  memory_size=10000,
                  batch_size=64):
 
@@ -62,7 +52,7 @@ class DQNAgent:
 
         self.memory = deque(maxlen=memory_size)
 
-        # Network weights: 12 -> 64 -> 64 -> 4
+        # Network weights: 7 -> 64 -> 64 -> 2
         self.w1 = np.random.randn(state_size, 64) * 0.1
         self.b1 = np.zeros((1, 64))
         self.w2 = np.random.randn(64, 64) * 0.1
@@ -190,7 +180,7 @@ class DQNAgent:
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
         with open(path, 'w') as f:
             json.dump(data, f)
-        print(f"  Saved weights → {path}")
+        print(f"  Saved weights -> {path}")
 
     def load(self, path="data/dqn_weights.json"):
         if not os.path.exists(path):
@@ -218,101 +208,77 @@ class DQNAgent:
 # STATE BUILDER
 # ==============================
 
-def build_state(arm_n_queue, arm_s_queue, arm_e_queue, arm_w_queue,
-                arm_n_wait,  arm_s_wait,  arm_e_wait,  arm_w_wait,
-                current_phase, phase_counter,
-                emergency_flag, elapsed_seconds):
+_ARMS = ['N', 'S', 'E', 'W']
+
+def build_state(pressures: dict, current_arm: str, ticks_in_phase: int,
+                emergency_flag: int) -> np.ndarray:
     """
-    Build the 12-element normalised state vector fed to the DQN.
+    Build the 7-element normalised state vector for the DQN.
 
     Parameters
     ----------
-    arm_*_queue  : int   – vehicles currently waiting (speed < 0.5 m/s) per arm
-    arm_*_wait   : float – avg waiting time (seconds) for vehicles on that arm
-    current_phase: int   – active green phase (0-3); during transitions this is
-                           the phase just ended (agent sees pending decision context)
-    phase_counter: int   – ticks spent in the current green phase
-    emergency_flag: int  – 1 if emergency vehicle detected in ROI
-    elapsed_seconds: float – simulation time used to derive time-of-day
+    pressures      : dict  – {'N': float, 'S': float, 'E': float, 'W': float}
+                             pressure = queue + 1.5 * avg_wait (from controller.py)
+    current_arm    : str   – arm currently holding GREEN ('N','S','E','W')
+    ticks_in_phase : int   – ticks spent in current green phase
+    emergency_flag : int   – 1 if emergency vehicle detected in ROI
     """
-    time_norm = (elapsed_seconds % 600) / 600.0
+    pN = pressures.get('N', 0.0)
+    pS = pressures.get('S', 0.0)
+    pE = pressures.get('E', 0.0)
+    pW = pressures.get('W', 0.0)
+    max_p = max(pN, pS, pE, pW, 1.0)   # relative normalisation
+    arm_idx = _ARMS.index(current_arm) if current_arm in _ARMS else 0
     return np.array([
-        min(arm_n_queue, MAX_VEHICLES) / MAX_VEHICLES,   # North arm queue
-        min(arm_s_queue, MAX_VEHICLES) / MAX_VEHICLES,   # South arm queue
-        min(arm_e_queue, MAX_VEHICLES) / MAX_VEHICLES,   # East  arm queue
-        min(arm_w_queue, MAX_VEHICLES) / MAX_VEHICLES,   # West  arm queue
-        min(arm_n_wait,  MAX_WAIT)     / MAX_WAIT,       # North avg wait
-        min(arm_s_wait,  MAX_WAIT)     / MAX_WAIT,       # South avg wait
-        min(arm_e_wait,  MAX_WAIT)     / MAX_WAIT,       # East  avg wait
-        min(arm_w_wait,  MAX_WAIT)     / MAX_WAIT,       # West  avg wait
-        current_phase  / 3.0,                             # active phase
-        min(phase_counter, MAX_DURATION) / MAX_DURATION, # time in phase
-        time_norm,                                        # time of day
-        float(emergency_flag),                            # emergency
+        pN / max_p,
+        pS / max_p,
+        pE / max_p,
+        pW / max_p,
+        arm_idx / 3.0,
+        min(ticks_in_phase, MAX_DURATION) / MAX_DURATION,
+        float(emergency_flag),
     ], dtype=np.float32)
 
 
 # ==============================
 # REWARD FUNCTION
 #
-# Formula:
-#   R = - α * waiting_time_penalty
-#       - β * queue_length_penalty
-#       + γ * vehicles_cleared_bonus
-#       + δ * speed_bonus
-#       ± emergency_handling
-#       - switching_penalty   (penalise unnecessary phase changes)
+# Formula (all terms are costs, except vehicles_cleared which is a benefit):
+#   R = - 5 * norm(avg_waiting_time)
+#       - 3 * norm(queue_length)
+#       + 2 * norm(vehicles_cleared)
+#       - 3 * wrong_lane_selection   (1 if serving non-max-pressure arm)
+#       - 1 * unnecessary_switch     (1 if switched without pressure advantage)
 #
-# "Pressure" concept:
-#   The agent learns to give GREEN to the arm with highest pressure
-#   (long queue + long wait). Per-arm state features enable this.
+# This strongly penalises green for empty lanes and rewards clearing congestion.
 # ==============================
 
-def compute_reward(avg_speed,
-                   emergency_flag,
-                   switching,
-                   avg_waiting_time=0.0,
-                   queue_length=0,
-                   vehicles_cleared=0):
+def compute_reward(avg_waiting_time: float = 0.0,
+                   queue_length: int = 0,
+                   vehicles_cleared: float = 0.0,
+                   wrong_lane_selection: int = 0,
+                   unnecessary_switch: int = 0) -> float:
     """
-    Reward formula (spec-aligned):
-        R = - α * waiting_time_penalty
-            - β * queue_length_penalty
-            + γ * vehicles_cleared_bonus
-            + δ * avg_speed_bonus
-            + emergency_handling_bonus
-            - switching_penalty
+    Reward shaped to penalise wrong arm selection and reward clearing congestion.
 
-    All terms normalised so individual contributions are on similar scales,
-    preventing any single factor from dominating Q-value learning.
+    wrong_lane_selection: 1 if the currently-serving arm pressure is below
+                          the max-pressure arm (i.e. wrong arm is green).
+    unnecessary_switch:   1 if a switch occurred but the new arm had no
+                          meaningful pressure advantage.
     """
-    MAX_SPEED = 14.0    # m/s — typical urban speed limit
+    MAX_WAIT_S  = 120.0
+    MAX_QUEUE   = 30.0
+    MAX_CLEARED = 10.0
 
-    # α — penalise long average waiting time (primary metric)
-    wait_norm  = min(avg_waiting_time, MAX_WAIT) / MAX_WAIT
-    reward     = -wait_norm * 6.0
+    wait_norm    = min(avg_waiting_time, MAX_WAIT_S) / MAX_WAIT_S
+    queue_norm   = min(queue_length,     MAX_QUEUE)  / MAX_QUEUE
+    cleared_norm = min(vehicles_cleared, MAX_CLEARED) / MAX_CLEARED
 
-    # β — penalise queue build-up
-    queue_norm = min(queue_length, MAX_VEHICLES) / MAX_VEHICLES
-    reward    -= queue_norm * 3.0
-
-    # γ — reward vehicles cleared through the intersection
-    reward    += min(vehicles_cleared, 15) * 0.4
-
-    # δ — reward free-flowing traffic (speed bonus)
-    speed_norm = min(avg_speed, MAX_SPEED) / MAX_SPEED
-    reward    += speed_norm * 2.5
-
-    # Emergency handling: bonus when emergency vehicle is in ROI
-    # (the agent should not try to override emergency — it's handled externally,
-    # but a positive signal confirms the priority state is recognised)
-    if emergency_flag == 1:
-        reward += 3.0
-
-    # Penalise unnecessary phase switching — stable phases reduce delay spikes
-    if switching:
-        reward -= 0.5
-
+    reward  = -5.0 * wait_norm
+    reward -= 3.0 * queue_norm
+    reward += 2.0 * cleared_norm
+    reward -= 3.0 * float(wrong_lane_selection)
+    reward -= 1.0 * float(unnecessary_switch)
     return float(reward)
 
 

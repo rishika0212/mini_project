@@ -14,12 +14,12 @@ import math
 class GroundSensor:
     """Simulates an inductive loop sensor on one approach arm."""
 
-    def __init__(self, arm_name, intersection_center, arm_direction, detection_range=50):
+    def __init__(self, arm_name, intersection_center, arm_direction, detection_range=35):
         """
         arm_name: 'N', 'S', 'E', 'W'
         intersection_center: carla.Location of intersection
         arm_direction: yaw angle of the road
-        detection_range: how far back to detect vehicles (50m default)
+        detection_range: how far back to detect vehicles (35m default)
         """
         self.arm_name = arm_name
         self.center = intersection_center
@@ -46,50 +46,67 @@ class GroundSensor:
         """
         Count vehicles in waiting zone on this arm.
         Returns: (vehicle_count, emergency_detected, emergency_vehicle)
+
+        Filtering rules (in order):
+          1. Vehicle inside intersection zone (< 8 m from center) → skip.
+          2. Vehicle farther than detection_range from center → skip.
+          3. Vehicle not on this arm (angular check ±45°) → skip.
+          4. Moving vehicle (speed > 0.5 m/s) heading away from center → skip.
+          Stopped vehicles always count — they represent the queue.
         """
         self.vehicle_count = 0
         self.emergency_vehicle = None
         self.emergency_count = 0
 
-        # Detect all regular vehicles in zone
         for v in all_vehicles:
             if not v.is_alive:
                 continue
+            if self._count_vehicle(v):
+                self.vehicle_count += 1
 
-            loc = v.get_location()
-            dist_to_sensor = loc.distance(self.sensor_pos)
-
-            # Vehicle within detection range?
-            if dist_to_sensor <= self.range:
-                # Check if vehicle is on this arm (angular check)
-                dx = loc.x - self.center.x
-                dy = loc.y - self.center.y
-                angle = math.degrees(math.atan2(dy, dx))
-
-                # Angular tolerance for arm detection
-                diff = abs((angle - self.direction + 180) % 360 - 180)
-                if diff < 45:  # Within ±45° of arm direction
-                    self.vehicle_count += 1
-
-        # Detect emergency vehicles in zone
         for emg_v in emergency_vehicles:
             if not emg_v.is_alive:
                 continue
-
-            loc = emg_v.get_location()
-            dist_to_sensor = loc.distance(self.sensor_pos)
-
-            if dist_to_sensor <= self.range:
-                dx = loc.x - self.center.x
-                dy = loc.y - self.center.y
-                angle = math.degrees(math.atan2(dy, dx))
-
-                diff = abs((angle - self.direction + 180) % 360 - 180)
-                if diff < 45:
-                    self.emergency_count += 1
-                    self.emergency_vehicle = emg_v
+            if self._count_vehicle(emg_v):
+                self.emergency_count += 1
+                self.emergency_vehicle = emg_v
 
         return self.vehicle_count, self.emergency_count > 0, self.emergency_vehicle
+
+    def _count_vehicle(self, v):
+        """Return True if vehicle should be counted for this arm."""
+        loc = v.get_location()
+        dx  = loc.x - self.center.x
+        dy  = loc.y - self.center.y
+        dist_to_center = math.sqrt(dx * dx + dy * dy)
+
+        # Step 1: ignore vehicles inside the intersection zone
+        if dist_to_center < 8.0:
+            return False
+
+        # Step 2: ignore vehicles beyond detection range
+        if dist_to_center > self.range:
+            return False
+
+        # Step 3: angular check — is vehicle on this arm?
+        angle = math.degrees(math.atan2(dy, dx))
+        diff  = abs((angle - self.direction + 180) % 360 - 180)
+        if diff >= 45:
+            return False
+
+        # Step 4: approaching filter for moving vehicles only.
+        # Stopped vehicles (speed ≤ 0.5 m/s) are always counted — they are queued.
+        vel   = v.get_velocity()
+        speed = math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
+        if speed > 0.5:
+            # Direction from vehicle toward intersection center
+            dir_x = -dx / dist_to_center
+            dir_y = -dy / dist_to_center
+            dot   = (vel.x * dir_x + vel.y * dir_y) / speed
+            if dot < 0:
+                return False  # moving away — already crossed intersection
+
+        return True
 
 
 class IntersectionGroundSensors:

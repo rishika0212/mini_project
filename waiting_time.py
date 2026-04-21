@@ -21,10 +21,17 @@ WAITING_SPEED_THRESHOLD = 0.5   # m/s — below this = waiting
 TICK_DURATION           = 0.05  # seconds per tick (fixed_delta_seconds)
 
 
+INTERSECTION_ZONE_M = 8.0    # vehicles closer than this to center are inside intersection
+
 def _get_arm(loc, center):
-    """Classify a vehicle into N/S/E/W approach arm relative to intersection center."""
+    """
+    Classify a vehicle into N/S/E/W approach arm.
+    Returns None if the vehicle is inside the intersection zone.
+    """
     dx = loc.x - center.x   # +ve = East
     dy = loc.y - center.y   # +ve = South (CARLA UE4 left-hand)
+    if abs(dx) < INTERSECTION_ZONE_M and abs(dy) < INTERSECTION_ZONE_M:
+        return None           # inside intersection — not an approach arm
     if abs(dx) >= abs(dy):
         return 'E' if dx >= 0 else 'W'
     return 'S' if dy >= 0 else 'N'
@@ -48,7 +55,8 @@ class VehicleWaitTracker:
             self.waiting_ticks += 1
             self.is_waiting     = True
         else:
-            self.is_waiting = False
+            self.is_waiting    = False
+            self.waiting_ticks = 0
 
     @property
     def waiting_time_seconds(self):
@@ -67,7 +75,7 @@ class IntersectionWaitingTimeTracker:
     Call reset_episode() at episode boundaries.
     """
 
-    def __init__(self, intersection_id, roi_radius=50, center=None):
+    def __init__(self, intersection_id, roi_radius=35, center=None):
         self.intersection_id = intersection_id
         self.roi_radius      = roi_radius
         self.center          = center   # carla.Location (needs .x, .y attributes)
@@ -88,6 +96,14 @@ class IntersectionWaitingTimeTracker:
         Call every tick.
         world_actors = world.get_actors().filter('vehicle.*')
         center       = carla.Location of intersection center
+
+        Admission rules for new vehicles entering the tracker:
+          - Must be within roi_radius and outside INTERSECTION_ZONE_M.
+          - Moving vehicles (speed > 0.5 m/s) must be approaching the center
+            (positive dot product of velocity toward center). This filters out
+            vehicles that have already crossed and are driving away.
+          - Stopped vehicles are always admitted — they represent the queue.
+        Already-tracked vehicles are updated regardless of direction.
         """
         self.tick_count += 1
 
@@ -95,12 +111,32 @@ class IntersectionWaitingTimeTracker:
         in_roi = {}
         for v in world_actors:
             loc  = v.get_location()
-            dist = loc.distance(center)
-            if dist < self.roi_radius:
-                vel   = v.get_velocity()
-                speed = math.sqrt(vel.x**2 + vel.y**2 + vel.z**2)
-                arm   = _get_arm(loc, center)
-                in_roi[v.id] = (speed, arm)
+            dx   = loc.x - center.x
+            dy   = loc.y - center.y
+            dist = math.sqrt(dx * dx + dy * dy)
+
+            # Skip intersection zone and vehicles beyond ROI
+            if dist < INTERSECTION_ZONE_M or dist >= self.roi_radius:
+                continue
+
+            vel   = v.get_velocity()
+            speed = math.sqrt(vel.x**2 + vel.y**2 + vel.z**2)
+            arm   = _get_arm(loc, center)
+
+            # Skip if arm is None (redundant safety check for intersection zone)
+            if arm is None:
+                continue
+
+            # For NEW vehicles: apply approaching filter to moving vehicles.
+            # Vehicles already tracked are kept regardless of direction.
+            if v.id not in self.active and speed > 0.5:
+                dir_x = -dx / dist
+                dir_y = -dy / dist
+                dot   = (vel.x * dir_x + vel.y * dir_y) / speed
+                if dot < 0:
+                    continue  # moving away — already passed the intersection
+
+            in_roi[v.id] = (speed, arm)
 
         # Update active trackers
         for vid, (speed, arm) in in_roi.items():
@@ -133,10 +169,10 @@ class IntersectionWaitingTimeTracker:
         arm_wait_secs = {'N': [], 'S': [], 'E': [], 'W': []}
         for t in self.active.values():
             arm = t.arm
-            if arm in arm_queues:
+            if arm and arm in arm_queues:
                 if t.is_waiting:
                     arm_queues[arm] += 1
-                arm_wait_secs[arm].append(t.waiting_time_seconds)
+                    arm_wait_secs[arm].append(t.waiting_time_seconds)
         arm_avg_waits = {
             arm: (sum(ws) / len(ws)) if ws else 0.0
             for arm, ws in arm_wait_secs.items()

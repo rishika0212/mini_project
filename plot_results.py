@@ -256,7 +256,7 @@ def plot_summary_bar():
 # ── Run all ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print(f"\nGenerating plots → {OUTPUT_DIR}/\n")
+    print(f"\nGenerating plots -> {OUTPUT_DIR}/\n")
     plot_avg_wait()
     plot_queue()
     plot_throughput()

@@ -25,8 +25,8 @@ from waiting_time import IntersectionWaitingTimeTracker
 # ── Args ───────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
 parser.add_argument('--policy',   default='dqn',
-                    choices=['dqn'],
-                    help='Policy to evaluate (DQN only)')
+                    choices=['dqn', 'fixed', 'random'],
+                    help='Policy to evaluate: dqn | fixed | random')
 parser.add_argument('--episodes', default=30, type=int,
                     help='Number of evaluation episodes')
 parser.add_argument('--ep_len',   default=500, type=int,
@@ -367,6 +367,7 @@ print(f"\nStarting evaluation — {args.episodes} episodes × {args.ep_len} tick
 YOLO_INTERVAL      = 10
 EMERGENCY_INTERVAL = 120
 EMERGENCY_LIFETIME = 260
+FIXED_PHASE_LEN    = 100   # ticks per green phase for fixed policy
 
 yolo_counts     = [0] * NUM_INT
 
@@ -423,19 +424,28 @@ try:
                 emergency_flag = 1 if emg_v is not None else 0
 
                 wait_stats_now = wait_trackers[idx].get_stats()
+
+                # Compute pressures: pressure = queue + 1.5 * avg_wait
+                pressures = {
+                    'N': wait_stats_now['arm_queues']['N'] + 1.5 * wait_stats_now['arm_avg_waits']['N'],
+                    'S': wait_stats_now['arm_queues']['S'] + 1.5 * wait_stats_now['arm_avg_waits']['S'],
+                    'E': wait_stats_now['arm_queues']['E'] + 1.5 * wait_stats_now['arm_avg_waits']['E'],
+                    'W': wait_stats_now['arm_queues']['W'] + 1.5 * wait_stats_now['arm_avg_waits']['W'],
+                }
+
+                # Map phase to arm: PHASE_NS_GREEN=0 -> 'N' or 'S', PHASE_EW_GREEN=2 -> 'E' or 'W'
+                if phase_states[idx] == PHASE_NS_GREEN:
+                    current_arm = 'N'  # Default; actual arm doesn't matter for pressure calc
+                elif phase_states[idx] == PHASE_EW_GREEN:
+                    current_arm = 'E'  # Default; actual arm doesn't matter for pressure calc
+                else:
+                    current_arm = 'N'  # Yellow phase, use 'N' as default
+
                 state = build_state(
-                    arm_n_queue     = wait_stats_now['arm_queues']['N'],
-                    arm_s_queue     = wait_stats_now['arm_queues']['S'],
-                    arm_e_queue     = wait_stats_now['arm_queues']['E'],
-                    arm_w_queue     = wait_stats_now['arm_queues']['W'],
-                    arm_n_wait      = wait_stats_now['arm_avg_waits']['N'],
-                    arm_s_wait      = wait_stats_now['arm_avg_waits']['S'],
-                    arm_e_wait      = wait_stats_now['arm_avg_waits']['E'],
-                    arm_w_wait      = wait_stats_now['arm_avg_waits']['W'],
-                    current_phase   = phase_states[idx],
-                    phase_counter   = phase_counters[idx],
+                    pressures       = pressures,
+                    current_arm     = current_arm,
+                    ticks_in_phase  = phase_counters[idx],
                     emergency_flag  = emergency_flag,
-                    elapsed_seconds = ep_tick * 0.05,
                 )
 
                 if emergency_flag == 1 and emg_v.is_alive:
@@ -446,7 +456,12 @@ try:
                     yellow_targets[idx] = PHASE_EW_GREEN
                     action = 0
                 else:
-                    action = agents[idx].act(state)
+                    if args.policy == 'dqn':
+                        action = agents[idx].act(state)
+                    elif args.policy == 'fixed':
+                        action = 1 if phase_counters[idx] >= FIXED_PHASE_LEN else 0
+                    else:  # random
+                        action = random.randint(0, 1)
 
                     if phase_states[idx] == PHASE_YELLOW:
                         yellow_remaining[idx] = max(0, yellow_remaining[idx] - 1)
