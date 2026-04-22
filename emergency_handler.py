@@ -33,7 +33,7 @@ import math
 # ── Timing constants (ticks at 0.05 s/tick) ──────────────────────────────────
 PRE_CLEAR_TICKS     = 40    # ~2 s   — all-RED safety clearance
 EMERGENCY_TIMEOUT   = 500   # ~25 s  — max GREEN before forced recovery
-RECOVERY_TICKS      = 400   # ~20 s  — total recovery duration
+RECOVERY_TICKS      = 900   # ~45 s  — ensured full cycle (4 x 220 ticks)
 RECOVERY_ARM_TICKS  = 180   # ~9 s   — time on each arm during cycling
 YELLOW_TICKS        = 40    # ~2 s   — yellow transition
 
@@ -65,14 +65,13 @@ class EmergencyState:
 def arm_from_location(loc, center) -> str:
     """
     Return which arm ('N','S','E','W') a vehicle is on, purely from geometry.
-    CARLA axes: +X = East, +Y = South.
-    Does NOT exclude the intersection zone — use get_emergency_lane() for that.
+    Town03: North=+X, South=-X, East=+Y, West=-Y
     """
     dx = loc.x - center.x
     dy = loc.y - center.y
     if abs(dx) >= abs(dy):
-        return 'E' if dx > 0 else 'W'
-    return 'S' if dy > 0 else 'N'
+        return 'N' if dx > 0 else 'S'
+    return 'E' if dy > 0 else 'W'
 
 
 # ── Internal utility ──────────────────────────────────────────────────────────
@@ -129,11 +128,17 @@ class EmergencyHandler:
 
     # ── Required public API ───────────────────────────────────────────────────
 
-    def detect_emergency(self, all_vehicles: list) -> list:
+    def detect_emergency(self, all_vehicles: list, known: list = None) -> list:
         """
         Scan all_vehicles for emergency vehicles approaching this intersection.
 
-        Admission criteria (all must pass):
+        known: optional list of vehicles already identified as emergency by the caller
+               (e.g. a spawned emergency actor tracked in demo.py). These bypass the
+               type-ID check and the direction filter — only range and zone are checked.
+               This handles generic/promoted vehicles whose type_id and role_name don't
+               match any emergency keyword.
+
+        Admission criteria for type-discovered vehicles (all must pass):
           1. Vehicle type_id or role_name matches an emergency keyword.
           2. Distance ≤ roi_radius from intersection centre.
           3. Distance ≥ INTERSECTION_ZONE (not already inside intersection).
@@ -143,9 +148,26 @@ class EmergencyHandler:
         Handles destroyed or otherwise inaccessible actors gracefully.
         Returns a list of qualifying CARLA vehicle actors (may be empty).
         """
-        detected = []
+        detected     = []
+        detected_ids = set()
+
+        # ── Known/forced vehicles: bypass type and direction checks ───────────
+        for v in (known or []):
+            try:
+                if not v.is_alive:
+                    continue
+                dist = _safe_distance(v, self.center)
+                if self.roi_radius >= dist >= INTERSECTION_ZONE:
+                    detected.append(v)
+                    detected_ids.add(v.id)
+            except RuntimeError:
+                continue
+
+        # ── Standard type-based detection ─────────────────────────────────────
         for v in all_vehicles:
             try:
+                if v.id in detected_ids:
+                    continue            # already added via known path
                 if not v.is_alive:
                     continue
                 if not self._is_emergency_type(v):
@@ -159,18 +181,16 @@ class EmergencyHandler:
                 if dist > self.roi_radius:
                     continue        # too far away
 
-                if dist < INTERSECTION_ZONE:
-                    continue        # already inside intersection — don't re-trigger
-
-                # Approaching filter: only check direction for moving vehicles.
-                # A stopped ambulance is waiting at the light → always count it.
+                # Admission criteria:
+                # 1. Moving vehicles (speed > 0.5 m/s) must be heading toward centre or be inside.
+                # 2. Driving away (dot < 0) means it has crossed.
                 vel   = v.get_velocity()
                 speed = math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
                 if speed > 0.5:
                     dir_x = -dx / dist
                     dir_y = -dy / dist
                     dot   = (vel.x * dir_x + vel.y * dir_y) / speed
-                    if dot < 0:
+                    if dot < -0.2:  # Tolerance for "heading away"
                         continue    # driving away — already crossed
 
                 detected.append(v)
@@ -200,21 +220,22 @@ class EmergencyHandler:
                 return None     # inside intersection — arm undefined
 
             if abs(dx) >= abs(dy):
-                return 'E' if dx > 0 else 'W'
-            return 'S' if dy > 0 else 'N'
+                return 'N' if dx > 0 else 'S'
+            return 'E' if dy > 0 else 'W'
 
         except RuntimeError:
             return None
 
-    def update_state_machine(self, all_vehicles: list) -> str:
+    def update_state_machine(self, all_vehicles: list, known: list = None) -> str:
         """
         Advance the FSM one tick using freshly detected emergency vehicles.
 
-        Calls detect_emergency() internally — no pre-filtering required.
+        known: optional list of pre-identified emergency vehicles passed directly
+               by the caller (see detect_emergency for details).
         Detected vehicles are cached in self.last_detected for event logging.
         Returns the current EmergencyState string.
         """
-        emg_vehicles        = self.detect_emergency(all_vehicles)
+        emg_vehicles        = self.detect_emergency(all_vehicles, known=known)
         self._last_detected = emg_vehicles
         emg_present         = bool(emg_vehicles)
 

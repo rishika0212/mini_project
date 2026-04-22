@@ -25,8 +25,8 @@ import os
 STATE_SIZE  = 7
 ACTION_SIZE = 2   # 0=keep, 1=allow-switch
 
-MAX_PRESSURE = 60.0   # normalisation ceiling for pressure values
-MAX_DURATION = 320.0  # MAX_GREEN_TICKS from controller.py
+MAX_PRESSURE = 60.0    # normalisation ceiling for pressure values
+MAX_DURATION = 1200.0  # MAX_GREEN_TICKS from controller.py
 
 
 class DQNAgent:

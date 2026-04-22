@@ -3,6 +3,9 @@ signal_manager.py
 =================
 Strict one-arm-green-at-a-time signal controller.
 
+Supports multiple traffic lights per arm so that multi-lane approaches
+all receive the correct state simultaneously.
+
 Safety invariants enforced at every call:
   - Only ONE arm can be GREEN at a time.
   - All other arms are always RED.
@@ -18,62 +21,72 @@ ARMS = ('N', 'S', 'E', 'W')
 class SignalManager:
     def __init__(self, lane_lights: dict):
         """
-        lane_lights: dict mapping arm ('N','S','E','W') to carla.TrafficLight actor.
+        lane_lights: dict mapping arm ('N','S','E','W') to either:
+          - a single carla.TrafficLight actor, OR
+          - a list of carla.TrafficLight actors (multi-lane support).
         """
-        self.lane_lights = lane_lights
-        # Internal state tracking so we only issue CARLA RPC calls when the
-        # desired state differs from what is already set.  Calling set_state()
-        # every tick causes CARLA to flicker through the intermediate all-RED
-        # step even in synchronous mode.
-        self._state      = 'all_red'   # 'all_red' | 'green' | 'yellow'
-        self._active_arm: str | None = None   # arm that is GREEN or YELLOW
+        # Normalise: every value becomes a list
+        self._groups: dict[str, list] = {}
+        for arm, val in lane_lights.items():
+            self._groups[arm] = val if isinstance(val, list) else [val]
+
+        self._state      = 'all_red'
+        self._active_arm: str | None = None
+        self._force_tick = 0  # Re-apply every N ticks to handle CARLA overrides
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _set_arm_state(self, arm: str, state) -> None:
+        for light in self._groups.get(arm, []):
+            try:
+                light.set_state(state)
+            except RuntimeError:
+                pass
+
+    def _set_all_state(self, state) -> None:
+        for arm in ARMS:
+            self._set_arm_state(arm, state)
 
     # ── Core primitives ───────────────────────────────────────────────────────
 
     def set_all_red(self):
-        """Set every mapped arm to RED. Skipped if already all-red."""
-        if self._state == 'all_red':
+        """Set every mapped arm to RED."""
+        if self._state == 'all_red' and self._force_tick % 20 != 0:
+            self._force_tick += 1
             return
-        for arm in ARMS:
-            light = self.lane_lights.get(arm)
-            if light is not None:
-                light.set_state(carla.TrafficLightState.Red)
+        
+        self._set_all_state(carla.TrafficLightState.Red)
         self._state      = 'all_red'
         self._active_arm = None
+        self._force_tick = 1
 
     def set_arm_green(self, arm: str):
         """
         Set *arm* to GREEN and all others to RED.
-        No-op if *arm* is already the active green arm (prevents flickering).
         """
-        if self._state == 'green' and self._active_arm == arm:
-            return  # already correct — skip RPC calls
-        for a in ARMS:
-            light = self.lane_lights.get(a)
-            if light is not None:
-                light.set_state(carla.TrafficLightState.Red)
-        light = self.lane_lights.get(arm)
-        if light is not None:
-            light.set_state(carla.TrafficLightState.Green)
+        if self._state == 'green' and self._active_arm == arm and self._force_tick % 20 != 0:
+            self._force_tick += 1
+            return
+
+        self._set_all_state(carla.TrafficLightState.Red)
+        self._set_arm_state(arm, carla.TrafficLightState.Green)
         self._state      = 'green'
         self._active_arm = arm
+        self._force_tick = 1
 
     def set_arm_yellow(self, arm: str):
         """
         Set *arm* to YELLOW, all others to RED.
-        No-op if *arm* is already the active yellow arm (prevents flickering).
         """
-        if self._state == 'yellow' and self._active_arm == arm:
-            return  # already correct — skip RPC calls
-        for a in ARMS:
-            light = self.lane_lights.get(a)
-            if light is not None:
-                light.set_state(carla.TrafficLightState.Red)
-        light = self.lane_lights.get(arm)
-        if light is not None:
-            light.set_state(carla.TrafficLightState.Yellow)
+        if self._state == 'yellow' and self._active_arm == arm and self._force_tick % 20 != 0:
+            self._force_tick += 1
+            return
+
+        self._set_all_state(carla.TrafficLightState.Red)
+        self._set_arm_state(arm, carla.TrafficLightState.Yellow)
         self._state      = 'yellow'
         self._active_arm = arm
+        self._force_tick = 1
 
     # ── Accessors ─────────────────────────────────────────────────────────────
 
@@ -86,16 +99,19 @@ class SignalManager:
     def verify(self) -> dict:
         """
         Read actual CARLA light states and check the single-green invariant.
-        Returns diagnostic dict with per-arm states and green count.
-        Prints an alert if more than one arm is GREEN.
+        Returns diagnostic dict with per-arm states and green arm count.
         """
-        states = {}
+        states      = {}
         green_count = 0
         for arm in ARMS:
-            light = self.lane_lights.get(arm)
-            if light is None:
+            lights = self._groups.get(arm, [])
+            if not lights:
                 continue
-            state = light.get_state()
+            # Use representative (first) light for the arm's state
+            try:
+                state = lights[0].get_state()
+            except RuntimeError:
+                continue
             if state == carla.TrafficLightState.Green:
                 states[arm] = 'GREEN'
                 green_count += 1
@@ -103,6 +119,7 @@ class SignalManager:
                 states[arm] = 'YELLOW'
             else:
                 states[arm] = 'RED'
+
         if green_count > 1:
             print(f"[SIGNAL ALERT] {green_count} GREEN arms simultaneously — "
                   f"safety violation! States: {states}")

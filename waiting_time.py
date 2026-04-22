@@ -27,40 +27,49 @@ def _get_arm(loc, center):
     """
     Classify a vehicle into N/S/E/W approach arm.
     Returns None if the vehicle is inside the intersection zone.
+    Town03: North=+X, South=-X, East=+Y, West=-Y
     """
-    dx = loc.x - center.x   # +ve = East
-    dy = loc.y - center.y   # +ve = South (CARLA UE4 left-hand)
+    dx = loc.x - center.x
+    dy = loc.y - center.y
     if abs(dx) < INTERSECTION_ZONE_M and abs(dy) < INTERSECTION_ZONE_M:
-        return None           # inside intersection — not an approach arm
+        return None
     if abs(dx) >= abs(dy):
-        return 'E' if dx >= 0 else 'W'
-    return 'S' if dy >= 0 else 'N'
+        return 'N' if dx >= 0 else 'S'
+    return 'E' if dy >= 0 else 'W'
 
 
 class VehicleWaitTracker:
     """Tracks waiting time for a single vehicle."""
 
     def __init__(self, vehicle_id, start_tick, arm='?'):
-        self.vehicle_id    = vehicle_id
-        self.start_tick    = start_tick
-        self.waiting_ticks = 0
-        self.total_ticks   = 0
-        self.is_waiting    = False
-        self.passed        = False
-        self.arm           = arm   # 'N', 'S', 'E', or 'W'
+        self.vehicle_id          = vehicle_id
+        self.start_tick          = start_tick
+        self.waiting_ticks       = 0   # current continuous stop (resets on movement)
+        self.total_waiting_ticks = 0   # cumulative stopped ticks across all stops
+        self.total_ticks         = 0
+        self.is_waiting          = False
+        self.passed              = False
+        self.arm                 = arm   # 'N', 'S', 'E', or 'W'
 
     def update(self, speed, current_tick):
         self.total_ticks += 1
         if speed < WAITING_SPEED_THRESHOLD:
-            self.waiting_ticks += 1
-            self.is_waiting     = True
+            self.waiting_ticks       += 1
+            self.total_waiting_ticks += 1
+            self.is_waiting           = True
         else:
             self.is_waiting    = False
             self.waiting_ticks = 0
 
     @property
-    def waiting_time_seconds(self):
+    def current_wait_seconds(self):
+        """Current continuous stop duration — used for per-arm pressure."""
         return self.waiting_ticks * TICK_DURATION
+
+    @property
+    def waiting_time_seconds(self):
+        """Total accumulated wait across all stops — used for episode/dashboard stats."""
+        return self.total_waiting_ticks * TICK_DURATION
 
     @property
     def total_time_seconds(self):
@@ -172,7 +181,7 @@ class IntersectionWaitingTimeTracker:
             if arm and arm in arm_queues:
                 if t.is_waiting:
                     arm_queues[arm] += 1
-                    arm_wait_secs[arm].append(t.waiting_time_seconds)
+                    arm_wait_secs[arm].append(t.current_wait_seconds)
         arm_avg_waits = {
             arm: (sum(ws) / len(ws)) if ws else 0.0
             for arm, ws in arm_wait_secs.items()
