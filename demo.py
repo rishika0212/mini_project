@@ -162,11 +162,12 @@ REPLENISH_RADIUS_M  = 180
 if 'Town03' in current_map:
     # Town03HD_Opt is heavier than Town03; keep actor count modest to avoid
     # simulator stalls/timeouts on lower-end GPUs.
-    GLOBAL_SPAWN_LIMIT = 50
-    NEARBY_SPAWN_LIMIT = 20
-    REPLENISH_TARGET   = 35
-    REPLENISH_RADIUS_M = 140
-    print("[PERF] Town03 detected: using reduced traffic load profile.")
+    # User requested way more vehicles near intersection.
+    GLOBAL_SPAWN_LIMIT = 150
+    NEARBY_SPAWN_LIMIT = 80
+    REPLENISH_TARGET   = 100
+    REPLENISH_RADIUS_M = 120
+    print("[PERF] Town03 detected: using high-density traffic load profile.")
 
 traffic_manager.set_global_distance_to_leading_vehicle(3.0)
 traffic_manager.global_percentage_speed_difference(-15)
