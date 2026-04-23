@@ -27,21 +27,21 @@ def _get_arm(loc, center):
     """
     Classify a vehicle into N/S/E/W approach arm.
     Returns None if the vehicle is inside the intersection zone.
-    Town03: North=+X, South=-X, East=+Y, West=-Y
+    Town03/Standard CARLA: East=+X, South=+Y, West=-X, North=-Y
     """
     dx = loc.x - center.x
     dy = loc.y - center.y
     if abs(dx) < INTERSECTION_ZONE_M and abs(dy) < INTERSECTION_ZONE_M:
         return None
-    if abs(dx) >= abs(dy):
-        return 'N' if dx >= 0 else 'S'
-    return 'E' if dy >= 0 else 'W'
+    if abs(dy) >= abs(dx):
+        return 'S' if dy > 0 else 'N'
+    return 'E' if dx > 0 else 'W'
 
 
 class VehicleWaitTracker:
     """Tracks waiting time for a single vehicle."""
 
-    def __init__(self, vehicle_id, start_tick, arm='?'):
+    def __init__(self, vehicle_id, start_tick, arm='?', tick_duration=0.05):
         self.vehicle_id          = vehicle_id
         self.start_tick          = start_tick
         self.waiting_ticks       = 0   # current continuous stop (resets on movement)
@@ -50,6 +50,7 @@ class VehicleWaitTracker:
         self.is_waiting          = False
         self.passed              = False
         self.arm                 = arm   # 'N', 'S', 'E', or 'W'
+        self.tick_duration       = tick_duration
 
     def update(self, speed, current_tick):
         self.total_ticks += 1
@@ -64,16 +65,16 @@ class VehicleWaitTracker:
     @property
     def current_wait_seconds(self):
         """Current continuous stop duration — used for per-arm pressure."""
-        return self.waiting_ticks * TICK_DURATION
+        return self.waiting_ticks * self.tick_duration
 
     @property
     def waiting_time_seconds(self):
         """Total accumulated wait across all stops — used for episode/dashboard stats."""
-        return self.total_waiting_ticks * TICK_DURATION
+        return self.total_waiting_ticks * self.tick_duration
 
     @property
     def total_time_seconds(self):
-        return self.total_ticks * TICK_DURATION
+        return self.total_ticks * self.tick_duration
 
 
 class IntersectionWaitingTimeTracker:
@@ -84,10 +85,11 @@ class IntersectionWaitingTimeTracker:
     Call reset_episode() at episode boundaries.
     """
 
-    def __init__(self, intersection_id, roi_radius=35, center=None):
+    def __init__(self, intersection_id, roi_radius=35, center=None, tick_duration=0.05):
         self.intersection_id = intersection_id
         self.roi_radius      = roi_radius
         self.center          = center   # carla.Location (needs .x, .y attributes)
+        self.tick_duration   = tick_duration
 
         # Active trackers: vehicle_id -> VehicleWaitTracker
         self.active   = {}
@@ -150,7 +152,7 @@ class IntersectionWaitingTimeTracker:
         # Update active trackers
         for vid, (speed, arm) in in_roi.items():
             if vid not in self.active:
-                self.active[vid] = VehicleWaitTracker(vid, current_tick, arm)
+                self.active[vid] = VehicleWaitTracker(vid, current_tick, arm, self.tick_duration)
             self.active[vid].update(speed, current_tick)
 
         # Detect vehicles that left ROI → mark as completed
@@ -195,7 +197,7 @@ class IntersectionWaitingTimeTracker:
             max_wait = 0.0
 
         # Throughput: vehicles/minute
-        elapsed_minutes = (self.tick_count * TICK_DURATION) / 60.0
+        elapsed_minutes = (self.tick_count * self.tick_duration) / 60.0
         throughput = self.throughput_count / elapsed_minutes \
                      if elapsed_minutes > 0 else 0.0
 

@@ -65,13 +65,13 @@ class EmergencyState:
 def arm_from_location(loc, center) -> str:
     """
     Return which arm ('N','S','E','W') a vehicle is on, purely from geometry.
-    Town03: North=+X, South=-X, East=+Y, West=-Y
+    Town03: East=+X, South=+Y, West=-X, North=-Y
     """
     dx = loc.x - center.x
     dy = loc.y - center.y
-    if abs(dx) >= abs(dy):
-        return 'N' if dx > 0 else 'S'
-    return 'E' if dy > 0 else 'W'
+    if abs(dy) >= abs(dx):
+        return 'S' if dy > 0 else 'N'
+    return 'E' if dx > 0 else 'W'
 
 
 # ── Internal utility ──────────────────────────────────────────────────────────
@@ -219,9 +219,9 @@ class EmergencyHandler:
             if abs(dx) < INTERSECTION_ZONE and abs(dy) < INTERSECTION_ZONE:
                 return None     # inside intersection — arm undefined
 
-            if abs(dx) >= abs(dy):
-                return 'N' if dx > 0 else 'S'
-            return 'E' if dy > 0 else 'W'
+            if abs(dy) >= abs(dx):
+                return 'S' if dy > 0 else 'N'
+            return 'E' if dx > 0 else 'W'
 
         except RuntimeError:
             return None

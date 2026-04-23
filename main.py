@@ -59,19 +59,19 @@ world  = client.get_world()
 
 settings = world.get_settings()
 settings.synchronous_mode    = True
-settings.fixed_delta_seconds = 0.05
+settings.fixed_delta_seconds = 0.1   # simulation speed x2
 settings.no_rendering_mode   = True   # headless for training speed
 world.apply_settings(settings)
 
 traffic_manager = client.get_trafficmanager()
 traffic_manager.set_synchronous_mode(True)
-traffic_manager.global_percentage_speed_difference(-15)
-traffic_manager.set_global_distance_to_leading_vehicle(3.0)
+traffic_manager.global_percentage_speed_difference(-30)  # slightly faster
+traffic_manager.set_global_distance_to_leading_vehicle(3.0) # more space to prevent lockups
 print("Connected to CARLA.")
 
 # ── DQN agent (same architecture as demo.py) ───────────────────────────────
 agent   = DQNAgent()
-tracker = EpisodeTracker(episode_length=500)
+tracker = EpisodeTracker(episode_length=800)   # 80s episodes
 tracker.set_int_id(1)
 
 WEIGHT_PATH = "data/dqn_weights_int1.json"
@@ -83,75 +83,77 @@ if not args.train:
 else:
     print(f"Training mode — epsilon={agent.epsilon:.3f}")
 
-# ── Intersection detection (mirrors demo.py logic) ─────────────────────────
-def group_lights(lights, threshold=45):
-    groups = []
-    for light in lights:
-        loc   = light.get_location()
-        added = False
-        for group in groups:
-            if loc.distance(group[0].get_location()) < threshold:
-                group.append(light); added = True; break
-        if not added:
-            groups.append([light])
-    return groups
+# ── Intersection detection (locked to user preferred site) ──────────────────
+USER_CENTER = carla.Location(x=-2.0, y=131.9, z=0)
+center      = USER_CENTER # Force absolute reference
+print(f"Intersection center: ({center.x:.1f}, {center.y:.1f})")
 
-traffic_lights = world.get_actors().filter("traffic.traffic_light")
-groups         = group_lights(list(traffic_lights), threshold=45)
-quad_groups    = [g for g in groups if len(g) >= 4]
-valid_groups   = quad_groups if quad_groups else [g for g in groups if len(g) >= 3]
+all_lights  = world.get_actors().filter("traffic.traffic_light")
+# Capture ALL lights within a 45m radius to avoid adjacent intersections
+group = [l for l in all_lights if l.get_location().distance(center) < 45]
 
-PREFERRED_CENTRE = carla.Location(x=0, y=0, z=0)
-valid_groups.sort(key=lambda g: sum(l.get_location().distance(PREFERRED_CENTRE)
-                                    for l in g) / len(g))
-
-if not valid_groups:
-    raise RuntimeError("No valid intersection found in this map.")
-
-group  = valid_groups[0]
-cx     = sum(l.get_location().x for l in group) / len(group)
-cy     = sum(l.get_location().y for l in group) / len(group)
-cz     = sum(l.get_location().z for l in group) / len(group)
-center = carla.Location(x=cx, y=cy, z=cz)
-print(f"Intersection center: ({cx:.1f}, {cy:.1f})")
+if not group:
+    raise RuntimeError(f"No traffic lights found near {center}")
 
 ROI_RADIUS = 35
 
-# ── Assign lights to arms (mirrors demo.py _assign_lights_to_arms) ─────────
+# ── Assign lights to arms (matches demo.py logic) ──────────────────────────
 def _light_angle_from_center(light):
     loc = light.get_location()
     return math.degrees(math.atan2(loc.y - center.y, loc.x - center.x))
 
 def assign_lights_to_arms(lights):
-    targets    = {'N': -90.0, 'S': 90.0, 'E': 0.0, 'W': 180.0}
+    # US-style Town03 corner angles: lights are on the FAR side of the intersection.
+    # To serve Arm N (North approach), we turn on lights at the South side (SE/SW).
+    # N -> SE (45), S -> NW (-135), E -> SW (135), W -> NE (-45)
+    targets    = {'N': 45.0, 'S': -135.0, 'E': 135.0, 'W': -45.0}
     arms       = ['N', 'S', 'E', 'W']
-    candidates = sorted(lights, key=lambda l: l.get_location().distance(center))[:4]
-    if len(candidates) < 4:
-        candidates = list(lights)
+    
+    # 1. Find canonical seeds (one per arm) using permutation optimization
+    # This ensures we pick the most balanced "core" light for each direction
+    candidates = sorted(lights, key=lambda l: l.get_location().distance(center))[:8]
+    best_map = {}
     if len(candidates) >= 4:
-        best_cost, best_map = float('inf'), None
-        for perm in itertools.permutations(candidates[:4], 4):
+        best_cost = float('inf')
+        for perm in itertools.permutations(candidates, 4):
             cost = sum(abs((_light_angle_from_center(l) - targets[a] + 180) % 360 - 180)
                        for a, l in zip(arms, perm))
             if cost < best_cost:
                 best_cost = cost
                 best_map  = {a: l for a, l in zip(arms, perm)}
-        if best_map:
-            return best_map
-    # greedy fallback
-    remaining, assigned = list(candidates), {}
-    for arm in arms:
-        if not remaining: break
-        best = min(remaining,
-                   key=lambda l: abs((_light_angle_from_center(l) - targets[arm] + 180) % 360 - 180))
-        assigned[arm] = best
-        remaining.remove(best)
-    return assigned
+    
+    if not best_map:
+        # fallback greedy seed
+        remaining, best_map = list(lights), {}
+        for arm in arms:
+            if not remaining: break
+            best = min(remaining, key=lambda l: abs((_light_angle_from_center(l) - targets[arm] + 180) % 360 - 180))
+            best_map[arm] = best
+            remaining.remove(best)
+
+    # 2. Assign ALL lights in the vicinity to the nearest arm (multi-lane support)
+    # This is critical: if even ONE head is missed, the Autopilot will stop.
+    arm_groups = {a: [best_map[a]] for a in arms if a in best_map}
+    canonical_ids = {l.id for l in best_map.values()}
+    
+    for light in lights:
+        if light.id in canonical_ids: continue
+        angle = _light_angle_from_center(light)
+        # Match to the best cardinal target
+        best_arm = min(targets.keys(), 
+                       key=lambda a: abs((angle - targets[a] + 180) % 360 - 180))
+        if best_arm not in arm_groups: arm_groups[best_arm] = []
+        arm_groups[best_arm].append(light)
+        
+    return arm_groups
 
 lane_lights = assign_lights_to_arms(list(group))
 for arm in lane_lights:
-    lane_lights[arm].freeze(True)
-print("Lane-light mapping:", {arm: lane_lights[arm].id for arm in lane_lights})
+    for light in lane_lights[arm]:
+        light.freeze(True)
+        light.set_state(carla.TrafficLightState.Red)
+
+print("Arm light groups:", {arm: len(lane_lights[arm]) for arm in lane_lights})
 
 # ── Core system components (identical to demo.py) ──────────────────────────
 signal_manager   = SignalManager(lane_lights)
@@ -161,7 +163,7 @@ emergency_handler = EmergencyHandler(center, roi_radius=ROI_RADIUS + 20)
 arm_directions = {'N': 270, 'S': 90, 'E': 0, 'W': 180}
 ground_sensor  = IntersectionGroundSensors(
     intersection_id=1, intersection_center=center, arm_directions=arm_directions)
-wait_tracker   = IntersectionWaitingTimeTracker(1, ROI_RADIUS, center)
+wait_tracker   = IntersectionWaitingTimeTracker(1, ROI_RADIUS, center, tick_duration=0.1)
 
 # ── Vehicle spawning ───────────────────────────────────────────────────────
 EMERGENCY_KW = ['ambulance', 'firetruck', 'police']
@@ -172,27 +174,34 @@ car_bps      = [bp for bp in blueprints
 spawn_points = world.get_map().get_spawn_points()
 vehicles     = []
 
-# Global spawns
-for sp in spawn_points[:args.vehicles]:
-    bp = random.choice(car_bps)
-    v  = world.try_spawn_actor(bp, sp)
-    if v:
-        v.set_autopilot(True)
-        vehicles.append(v)
+def spawn_traffic(count):
+    global vehicles
+    # Global spawns
+    random.shuffle(spawn_points)
+    for sp in spawn_points:
+        if len(vehicles) >= count:
+            break
+        bp = random.choice(car_bps)
+        v  = world.try_spawn_actor(bp, sp)
+        if v:
+            v.set_autopilot(True)
+            vehicles.append(v)
 
-# Nearby spawns around intersection
-nearby_sps = [sp for sp in spawn_points if sp.location.distance(center) < 80]
-n = 0
-for sp in nearby_sps:
-    if n >= 40: break
-    bp = random.choice(car_bps)
-    v  = world.try_spawn_actor(bp, sp)
-    if v:
-        v.set_autopilot(True)
-        vehicles.append(v)
-        n += 1
+    # Nearby spawns around intersection
+    nearby_sps = [sp for sp in spawn_points if sp.location.distance(center) < 100]
+    random.shuffle(nearby_sps)
+    n = 0
+    for sp in nearby_sps:
+        if n >= 40: break # Reduced from 60 to prevent saturation gridlock
+        bp = random.choice(car_bps)
+        v  = world.try_spawn_actor(bp, sp)
+        if v:
+            v.set_autopilot(True)
+            vehicles.append(v)
+            n += 1
+    print(f"  [SPAWN] {len(vehicles)} vehicles active.")
 
-print(f"Spawned {len(vehicles)} vehicles.")
+spawn_traffic(args.vehicles)
 for _ in range(20): world.tick()
 
 # ── Emergency spawn (mirrors demo.py spawn_emergency) ─────────────────────
@@ -326,25 +335,23 @@ try:
 
         all_actors = list(world.get_actors().filter("vehicle.*"))
 
-        # -- Vehicle replenishment (every 300 ticks) -------------------------
-        # Vehicles leave the map over time. Without replenishment the
-        # intersection empties and the DQN trains on zero-pressure states,
-        # which is exactly what caused the useless -1500 reward flat-line.
-        if tick_count % 300 == 0:
+        # -- Vehicle replenishment (every 100 ticks) -------------------------
+        if tick_count % 100 == 0:
             alive_nearby = sum(
                 1 for v in all_actors
                 if v.is_alive
-                and v.get_location().distance(center) < 150
+                and v.get_location().distance(center) < 120
                 and not is_emergency_vehicle(v)
             )
-            if alive_nearby < 40:
-                need = 80 - alive_nearby
+            if alive_nearby < 70:
+                need = 100 - alive_nearby
                 random.shuffle(spawn_points)
                 added = 0
                 for sp in spawn_points:
                     if added >= need:
                         break
-                    if sp.location.distance(center) < 130:
+                    # Spawn within reasonable range of intersection
+                    if 30 < sp.location.distance(center) < 120:
                         bp = random.choice(car_bps)
                         nv = world.try_spawn_actor(bp, sp)
                         if nv:
@@ -411,7 +418,19 @@ try:
             # ── Normal DQN + pressure control (identical to demo.py) ───────
             system_mode = 'DQN'
             pressure_ctrl.tick()
-            pressures = pressure_ctrl.compute_pressures(arm_queues, arm_avg_waits)
+            
+            # Per-arm queues and waits (matches demo.py lines 1001-1007)
+            arm_queues = dict(wt_stats['arm_queues'])
+            raw_waits  = dict(wt_stats['arm_avg_waits'])
+            current_wait = raw_waits.get(pressure_ctrl.current_arm, 0.0)
+            
+            # Normalize waits relative to current serving arm to resolve symmetry deadlocks
+            rel_waits = {
+                arm: max(0.0, w - current_wait * 0.5)
+                for arm, w in raw_waits.items()
+            }
+            
+            pressures = pressure_ctrl.compute_pressures(arm_queues, rel_waits)
 
             rl_state  = build_state(pressures, pressure_ctrl.current_arm,
                                     pressure_ctrl.ticks_in_phase,
@@ -422,7 +441,7 @@ try:
 
             best_pressure    = pressures.get(best_arm, 0.0)
             current_pressure = pressures.get(pressure_ctrl.current_arm, 0.0)
-            wrong_lane  = 1 if (best_pressure > current_pressure * 1.3
+            wrong_lane  = 1 if (best_pressure > current_pressure * 1.1
                                 and best_arm != pressure_ctrl.current_arm) else 0
             unnecessary = 1 if (do_switch and best_pressure <= current_pressure * 1.05) else 0
 
@@ -447,14 +466,30 @@ try:
             if args.train and prev_state is not None:
                 done = tracker.is_done()
                 agent.remember(prev_state, prev_action, reward, rl_state, done)
-                loss = agent.replay()
+                
+                # Training every 10 ticks significantly speeds up the simulation
+                # without harming the learning curve for this simple state space.
+                loss = None
+                if tick_count % 10 == 0 or done:
+                    loss = agent.replay()
+                
                 tracker.update(reward, loss)
 
                 if done:
                     tracker.next_episode(agent)
-                    # Reset environment state for next episode
+                    # Reset internal state for next episode but keep the world/vehicles
+                    tick_count = 0
+                    prev_state = None
                     yellow_active = False
                     pressure_ctrl.ticks_in_phase = 0
+                    wait_tracker.reset_episode()
+                    
+                    # Re-select best arm to avoid getting stuck on one arm across episodes
+                    all_actors = list(world.get_actors().filter("vehicle.*"))
+                    counts = ground_sensor.update(all_actors, [])["arm_counts"]
+                    new_arm = max(['N', 'S', 'E', 'W'], key=lambda a: counts.get(a, 0))
+                    pressure_ctrl.current_arm = new_arm
+                    signal_manager.set_arm_green(new_arm)
 
             prev_state  = rl_state
             prev_action = rl_action
@@ -477,14 +512,19 @@ try:
             ])
 
         # ── Status print every 200 ticks ──────────────────────────────────
-        if tick_count % 200 == 0:
+        if tick_count > 0 and tick_count % 200 == 0:
             wt = wt_stats['avg_waiting_time']
             ql = wt_stats['queue_length']
+            tp = wt_stats.get('throughput_vpm', 0.0)
+            diag = signal_manager.verify()
+            states_str = "/".join([f"{a}:{s[0]}" for a,s in diag['states'].items()])
+            
             print(f"  tick={tick_count:6d}  ep={tracker.episode:3d}  "
                   f"eps={agent.epsilon:.3f}  "
                   f"arm={pressure_ctrl.current_arm}  "
                   f"wait={wt:.1f}s  queue={ql}  "
-                  f"mode={system_mode}  "
+                  f"vpm={tp:.1f}  "
+                  f"lights=[{states_str}]  "
                   f"p=N{pressures.get('N',0):.1f}/"
                   f"S{pressures.get('S',0):.1f}/"
                   f"E{pressures.get('E',0):.1f}/"
@@ -499,7 +539,7 @@ finally:
 
     if args.train:
         agent.save(WEIGHT_PATH)
-        print(f"Weights saved → {WEIGHT_PATH}")
+        print(f"Weights saved -> {WEIGHT_PATH}")
 
     # Restore async mode
     settings.synchronous_mode = False

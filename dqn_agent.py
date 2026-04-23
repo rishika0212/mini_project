@@ -26,7 +26,7 @@ STATE_SIZE  = 7
 ACTION_SIZE = 2   # 0=keep, 1=allow-switch
 
 MAX_PRESSURE = 60.0    # normalisation ceiling for pressure values
-MAX_DURATION = 1200.0  # MAX_GREEN_TICKS from controller.py
+MAX_DURATION = 800.0   # Matches episode length for normalisation
 
 
 class DQNAgent:
@@ -37,7 +37,7 @@ class DQNAgent:
                  gamma=0.95,
                  epsilon=1.0,
                  epsilon_min=0.05,
-                 epsilon_decay=0.9995,
+                 epsilon_decay=0.9998,
                  memory_size=10000,
                  batch_size=64):
 
@@ -183,11 +183,15 @@ class DQNAgent:
         print(f"  Saved weights -> {path}")
 
     def load(self, path="data/dqn_weights.json"):
-        if not os.path.exists(path):
-            print(f"  No saved weights at {path} — starting fresh.")
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            print(f"  No saved weights (or empty file) at {path} — starting fresh.")
             return
-        with open(path) as f:
-            data = json.load(f)
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"  Error loading weights from {path}: {e} — starting fresh.")
+            return
         # Guard against stale weights from an older state-size
         saved_input_size = np.array(data['w1']).shape[0]
         if saved_input_size != self.state_size:
@@ -274,8 +278,8 @@ def compute_reward(avg_waiting_time: float = 0.0,
     queue_norm   = min(queue_length,     MAX_QUEUE)  / MAX_QUEUE
     cleared_norm = min(vehicles_cleared, MAX_CLEARED) / MAX_CLEARED
 
-    reward  = -5.0 * wait_norm
-    reward -= 3.0 * queue_norm
+    reward  = -8.0 * wait_norm
+    reward -= 4.0 * queue_norm
     reward += 2.0 * cleared_norm
     reward -= 3.0 * float(wrong_lane_selection)
     reward -= 1.0 * float(unnecessary_switch)

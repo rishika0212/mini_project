@@ -32,14 +32,15 @@ class SignalManager:
 
         self._state      = 'all_red'
         self._active_arm: str | None = None
-        self._force_tick = 0  # Re-apply every N ticks to handle CARLA overrides
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _set_arm_state(self, arm: str, state) -> None:
         for light in self._groups.get(arm, []):
             try:
+                light.freeze(False) # Unfreeze to allow state change
                 light.set_state(state)
+                light.freeze(True)  # Re-freeze to lock state
             except RuntimeError:
                 pass
 
@@ -51,42 +52,27 @@ class SignalManager:
 
     def set_all_red(self):
         """Set every mapped arm to RED."""
-        if self._state == 'all_red' and self._force_tick % 20 != 0:
-            self._force_tick += 1
-            return
-        
         self._set_all_state(carla.TrafficLightState.Red)
         self._state      = 'all_red'
         self._active_arm = None
-        self._force_tick = 1
 
     def set_arm_green(self, arm: str):
         """
         Set *arm* to GREEN and all others to RED.
         """
-        if self._state == 'green' and self._active_arm == arm and self._force_tick % 20 != 0:
-            self._force_tick += 1
-            return
-
         self._set_all_state(carla.TrafficLightState.Red)
         self._set_arm_state(arm, carla.TrafficLightState.Green)
         self._state      = 'green'
         self._active_arm = arm
-        self._force_tick = 1
 
     def set_arm_yellow(self, arm: str):
         """
         Set *arm* to YELLOW, all others to RED.
         """
-        if self._state == 'yellow' and self._active_arm == arm and self._force_tick % 20 != 0:
-            self._force_tick += 1
-            return
-
         self._set_all_state(carla.TrafficLightState.Red)
         self._set_arm_state(arm, carla.TrafficLightState.Yellow)
         self._state      = 'yellow'
         self._active_arm = arm
-        self._force_tick = 1
 
     # ── Accessors ─────────────────────────────────────────────────────────────
 

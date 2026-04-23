@@ -4,19 +4,14 @@ train_orchestrator.py
 Two-phase training orchestrator for the demo.py single-arm DQN system.
 
 Phase 1 — Base policy (no emergencies, sparse traffic)
-  • 350 episodes
-  • 120 vehicles
+  • 150 episodes
+  • 100 vehicles
   • Emergencies disabled
-  • DQN learns basic pressure-based arm switching
 
 Phase 2 — Emergency robustness (with emergencies, more traffic)
-  • 150 episodes (total 500)
-  • 220 vehicles
-  • Emergencies enabled every ~90 s
-  • DQN learns to handle emergency interruptions
-
-Weights are saved to data/dqn_weights_int1.json after each phase
-and loaded by demo.py automatically.
+  • 100 episodes
+  • 150 vehicles
+  • Emergencies enabled
 
 Usage:
     python train_orchestrator.py
@@ -32,10 +27,6 @@ import os
 def run_phase(label, episodes, vehicles, no_emg, timeout_hours=3.0):
     """
     Run main.py --train with given parameters.
-    Streams output in real time.
-    Stops when target episode count is reached or timeout expires.
-
-    Returns True if target was reached, False otherwise.
     """
     print(f"\n{'='*65}")
     print(f"  {label}")
@@ -136,18 +127,12 @@ def main():
     print("="*65)
     print("""
   Phase 1 : Learn basic arm switching (sparse, no emergencies)
-            350 episodes · 120 vehicles · ~2–3 hours
+            80 episodes · 80 vehicles · ~35–45 mins
 
   Phase 2 : Learn emergency robustness (more traffic, emergencies on)
-            150 episodes · 220 vehicles · ~1–2 hours
+            40 episodes · 120 vehicles · ~20–25 mins
 
-  Total   : 500 episodes · ~3–5 hours
-
-  Weights saved to: data/dqn_weights_int1.json
-  Load by demo.py automatically on next run.
-
-  Press Ctrl+C at any time to stop safely — weights are saved
-  at episode checkpoints (every 10 episodes) and on exit.
+  Total   : 120 episodes · ~1.0 hour
 """)
 
     os.makedirs("data", exist_ok=True)
@@ -159,10 +144,10 @@ def main():
     print("\n[ORCHESTRATOR] Starting PHASE 1 — base policy...")
     ok = run_phase(
         label         = "PHASE 1: Base policy — sparse traffic, no emergencies",
-        episodes      = 350,
-        vehicles      = 120,
+        episodes      = 80,
+        vehicles      = 80,
         no_emg        = True,
-        timeout_hours = 3.5,
+        timeout_hours = 2.0,
     )
 
     if not ok:
@@ -182,10 +167,10 @@ def main():
     print("\n[ORCHESTRATOR] Starting PHASE 2 — emergency robustness...")
     ok = run_phase(
         label         = "PHASE 2: Emergency robustness — medium traffic, emergencies enabled",
-        episodes      = 150,   # 150 new episodes; weights from Phase 1 are loaded automatically
-        vehicles      = 220,
+        episodes      = 40,   # 40 new episodes
+        vehicles      = 120,
         no_emg        = False,
-        timeout_hours = 2.5,
+        timeout_hours = 2.0,
     )
 
     if not ok:

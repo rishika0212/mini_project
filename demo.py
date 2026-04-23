@@ -29,11 +29,12 @@ except ImportError:
     _HAS_WINSOUND = False
 
 from signal_manager    import SignalManager
-from controller        import PressureController, YELLOW_TICKS
+from controller        import PressureController, YELLOW_TICKS, MIN_GREEN_TICKS
 from emergency_handler import EmergencyHandler, EmergencyState
 from waiting_time      import IntersectionWaitingTimeTracker
 from fallback          import FallbackController, ControlMode
 from ground_sensors    import IntersectionGroundSensors
+from dqn_agent         import DQNAgent, EpisodeTracker, build_state, compute_reward
 
 import time
 
@@ -126,7 +127,7 @@ center = intersection_centers[0]
 ROI_RADIUS          = 35
 ROAD_DETECTION_DIST = 75
 
-wait_trackers = [IntersectionWaitingTimeTracker(i + 1, ROI_RADIUS, intersection_centers[i])
+wait_trackers = [IntersectionWaitingTimeTracker(i + 1, ROI_RADIUS, intersection_centers[i], tick_duration=0.05)
                  for i in range(NUM_INT)]
 
 # ground_sensor is initialised below, after arm_directions are derived from light positions
@@ -234,10 +235,13 @@ def _light_angle_from_center(light):
 def _assign_lights_to_arms(lights):
     if not lights:
         return {}
-    # Light angles at corners: N is Top-Left, S is Bottom-Right, E is Top-Right, W is Bottom-Left
-    # User Mapping: 1->C(E), 2->E(S), 3->G(W), 4->A(N)
-    # Light 1=-45, 2=45, 3=135, 4=-135
-    targets = {'N': -135.0, 'S': 45.0, 'E': -45.0, 'W': 135.0}
+    # US-style Town03 corner angles: lights are on the FAR side of the intersection.
+    # User mapping:
+    # 1. Light 1 (NW, -135) -> Lane C (East approach, +X=E)
+    # 2. Light 2 (NE, -45)  -> Lane E (South approach, +Y=S)
+    # 3. Light 3 (SE, 45)   -> Lane G (West approach, -X=W)
+    # 4. Light 4 (SW, 135)  -> Lane A (North approach, -Y=N)
+    targets = {'N': 135.0, 'S': -45.0, 'E': -135.0, 'W': 45.0}
     arms    = ['N', 'S', 'E', 'W']
     candidates = sorted(lights, key=lambda l: l.get_location().distance(center))[:4]
     if len(candidates) < 4:
@@ -275,7 +279,7 @@ print("Lane-light mapping:", {arm: lane_lights[arm].id for arm in lane_lights})
 #   1. Seed each arm with its permutation-optimal canonical light from lane_lights.
 #      This is correct by construction — the permutation search guarantees it.
 #   2. Assign any remaining lights to the nearest arm by angle (multi-lane support).
-_arm_angle_targets = {'N': -135.0, 'S': 45.0, 'E': -45.0, 'W': 135.0}
+_arm_angle_targets = {'N': 135.0, 'S': -45.0, 'E': -135.0, 'W': 45.0}
 arm_light_groups   = {'N': [], 'S': [], 'E': [], 'W': []}
 _canonical_ids     = set()
 
@@ -296,14 +300,9 @@ for _arm in ['N', 'S', 'E', 'W']:
         print(f"[WARN] arm_light_groups: {_arm} still has no lights after seeding — check lane_lights.")
 print("Arm light groups:", {arm: len(arm_light_groups[arm]) for arm in arm_light_groups})
 
-# Derive actual road directions from light positions for ground sensors
-arm_directions = {}
-for _arm, _lights in arm_light_groups.items():
-    if _lights:
-        _angles = [_light_angle_from_center(_l) for _l in _lights]
-        arm_directions[_arm] = (sum(_angles) / len(_angles)) % 360
-    else:
-        arm_directions[_arm] = {'N': 0, 'S': 180, 'E': 90, 'W': 270}[_arm]
+# Road directions for ground sensors (angle from center to approach arm)
+# In Town03: East is +X (0 deg), South is +Y (90 deg), West is -X (180 deg), North is -Y (-90 deg)
+arm_directions = {'N': -90.0, 'S': 90.0, 'E': 0.0, 'W': 180.0}
 
 ground_sensor = IntersectionGroundSensors(
     intersection_id=1, intersection_center=center, arm_directions=arm_directions)
@@ -314,6 +313,12 @@ signal_manager = SignalManager(arm_light_groups)
 # ── Pressure controller + emergency handler ───────────────────────────────────
 pressure_ctrl    = PressureController()
 emergency_handler = EmergencyHandler(center, roi_radius=ROI_RADIUS + 20)
+
+# ── DQN Agent for timing optimization ─────────────────────────────────────────
+dqn_agent = DQNAgent()
+dqn_agent.load("data/dqn_weights_int1.json")
+ep_tracker = EpisodeTracker(episode_length=1000)
+ep_tracker.set_int_id(1)
 
 # ── Fixed-time cycling state (used in FALLBACK mode) ─────────────────────────
 FIXED_ARM_ORDER    = ['N', 'S', 'E', 'W']
@@ -903,6 +908,10 @@ wait_history   = [[] for _ in range(NUM_INT)]
 pressures      = {arm: 0.0 for arm in ['N', 'S', 'E', 'W']}
 latest_sensor_counts = {'N': 0, 'S': 0, 'E': 0, 'W': 0}
 
+# DQN Training state
+prev_dqn_state  = None
+prev_dqn_action = None
+
 print(f"\nDemo running — Pressure-Based Traffic Controller.")
 print(f"  CAM 2: Intersection overview  |  Dashboard: signal metrics")
 print(f"  Press Q to quit.")
@@ -916,6 +925,7 @@ try:
             print("[ERROR] Simulator stopped responding in main loop.")
             break
         tick_count += 1
+        pressure_ctrl.tick()
 
         # ── Emergency vehicle lifecycle ────────────────────────────────────────
         if emergency_vehicle and emergency_vehicle.is_alive:
@@ -1078,8 +1088,38 @@ try:
             else:
                 system_mode = 'PRESSURE'
                 if not yellow_active:
+                    # Current metrics for state and reward
+                    q_len = _wt_stats['queue_length']
+                    a_wait = _wt_stats['avg_waiting_time']
+                    
+                    # build DQN state
+                    _dqn_state = build_state(pressures, pressure_ctrl.current_arm, 
+                                             pressure_ctrl.ticks_in_phase, _emg_flag)
+
+                    # ── Training: Reward for the PREVIOUS action ──────────────────
+                    if prev_dqn_state is not None:
+                        # compute reward based on current intersection state
+                        # wrong_lane_selection: 1 if current arm is not the best arm
+                        best_arm_by_p = pressure_ctrl.select_best_arm(pressures)
+                        wrong_lane = 1 if pressure_ctrl.current_arm != best_arm_by_p else 0
+                        
+                        reward = compute_reward(avg_waiting_time=a_wait,
+                                               queue_length=q_len,
+                                               wrong_lane_selection=wrong_lane)
+                        
+                        dqn_agent.remember(prev_dqn_state, prev_dqn_action, reward, _dqn_state, False)
+                        loss = dqn_agent.replay()
+                        ep_tracker.update(reward, loss)
+                        
+                        if ep_tracker.is_done():
+                            ep_tracker.next_episode(dqn_agent)
+
+                    _dqn_action = dqn_agent.act(_dqn_state)
+                    prev_dqn_state = _dqn_state
+                    prev_dqn_action = _dqn_action
+
                     # 4. Switch decision
-                    do_switch, best_arm = pressure_ctrl.should_switch(pressures)
+                    do_switch, best_arm = pressure_ctrl.should_switch(pressures, dqn_action=_dqn_action)
                     
                     # 5. If yes — yellow for 3s, then green
                     if do_switch:
