@@ -114,13 +114,17 @@ class PressureController:
         # Do NOT zero starvation[new_arm] here — let it decay gradually through tick()
         # so the boost persists long enough for the arm to clear its actual backlog.
 
-    def tick(self):
+    def tick(self, arm_queues: dict = None):
         """
-        Advance per-tick counters.
+        Advance per-tick counters. 
+        Only increment starvation for arms that actually have vehicles waiting.
         """
         self.ticks_in_phase += 1
         for arm in ARMS:
-            if arm != self.current_arm:
+            if arm == self.current_arm:
+                self.starvation[arm] = 0
+            elif arm_queues and arm_queues.get(arm, 0) > 0:
                 self.starvation[arm] += 1
             else:
+                # If arm is empty, starvation shouldn't build up
                 self.starvation[arm] = 0

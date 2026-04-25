@@ -32,26 +32,35 @@ class SignalManager:
 
         self._state      = 'all_red'
         self._active_arm: str | None = None
+        
+        # Performance/Flicker prevention: track actual state of every light
+        self._light_states = {} # actor_id -> TrafficLightState
+        self._set_all_state(carla.TrafficLightState.Red, force=True)
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
-    def _set_arm_state(self, arm: str, state) -> None:
+    def _set_arm_state(self, arm: str, state, force=False) -> None:
         for light in self._groups.get(arm, []):
             try:
-                light.freeze(False) # Unfreeze to allow state change
+                if not force and self._light_states.get(light.id) == state:
+                    continue
+                
+                # Directly set state while frozen to avoid jump/flicker
                 light.set_state(state)
-                light.freeze(True)  # Re-freeze to lock state
+                self._light_states[light.id] = state
             except RuntimeError:
                 pass
 
-    def _set_all_state(self, state) -> None:
+    def _set_all_state(self, state, force=False) -> None:
         for arm in ARMS:
-            self._set_arm_state(arm, state)
+            self._set_arm_state(arm, state, force=force)
 
     # ── Core primitives ───────────────────────────────────────────────────────
 
     def set_all_red(self):
         """Set every mapped arm to RED."""
+        if self._state == 'all_red':
+            return
         self._set_all_state(carla.TrafficLightState.Red)
         self._state      = 'all_red'
         self._active_arm = None
@@ -60,6 +69,8 @@ class SignalManager:
         """
         Set *arm* to GREEN and all others to RED.
         """
+        if self._state == 'green' and self._active_arm == arm:
+            return
         self._set_all_state(carla.TrafficLightState.Red)
         self._set_arm_state(arm, carla.TrafficLightState.Green)
         self._state      = 'green'
@@ -69,6 +80,8 @@ class SignalManager:
         """
         Set *arm* to YELLOW, all others to RED.
         """
+        if self._state == 'yellow' and self._active_arm == arm:
+            return
         self._set_all_state(carla.TrafficLightState.Red)
         self._set_arm_state(arm, carla.TrafficLightState.Yellow)
         self._state      = 'yellow'

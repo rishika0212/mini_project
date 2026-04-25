@@ -31,11 +31,11 @@ Backward-compatible:
 import math
 
 # ── Timing constants (ticks at 0.05 s/tick) ──────────────────────────────────
-PRE_CLEAR_TICKS     = 40    # ~2 s   — all-RED safety clearance
-EMERGENCY_TIMEOUT   = 500   # ~25 s  — max GREEN before forced recovery
-RECOVERY_TICKS      = 900   # ~45 s  — ensured full cycle (4 x 220 ticks)
-RECOVERY_ARM_TICKS  = 180   # ~9 s   — time on each arm during cycling
-YELLOW_TICKS        = 40    # ~2 s   — yellow transition
+PRE_CLEAR_TICKS     = 10    # ~0.5 s — minimal all-RED safety clearance
+EMERGENCY_TIMEOUT   = 400   # ~20 s  — max GREEN before forced exit
+RECOVERY_TICKS      = 0     # 0 s    — go straight back to normal
+RECOVERY_ARM_TICKS  = 40    # unused
+YELLOW_TICKS        = 30    # ~1.5 s — yellow transition
 
 # ── Detection geometry ────────────────────────────────────────────────────────
 DETECTION_RANGE     = 40.0  # metres — maximum distance to detect emergency vehicle
@@ -182,16 +182,18 @@ class EmergencyHandler:
                     continue        # too far away
 
                 # Admission criteria:
-                # 1. Moving vehicles (speed > 0.5 m/s) must be heading toward centre or be inside.
-                # 2. Driving away (dot < 0) means it has crossed.
+                # 1. Moving vehicles (speed > 0.5 m/s) must be heading toward centre.
+                # 2. Driving away (dot < -0.1) means it has crossed.
                 vel   = v.get_velocity()
                 speed = math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
                 if speed > 0.5:
                     dir_x = -dx / dist
                     dir_y = -dy / dist
+                    # Dot product of velocity and direction toward center
+                    # dot > 0 means moving toward center
                     dot   = (vel.x * dir_x + vel.y * dir_y) / speed
-                    if dot < -0.2:  # Tolerance for "heading away"
-                        continue    # driving away — already crossed
+                    if dot < 0.2:  # Stricter: must be clearly moving TOWARD center
+                        continue    # driving away or sideways — skip
 
                 detected.append(v)
 
@@ -403,6 +405,13 @@ class EmergencyHandler:
               f"(max {EMERGENCY_TIMEOUT * 0.05:.0f}s).")
 
     def _enter_recovery(self, reason: str = ""):
+        if RECOVERY_TICKS <= 0:
+            self.state = EmergencyState.NORMAL
+            self.emergency_arm = None
+            msg = f" ({reason})" if reason else ""
+            print(f"[EMERGENCY] END{msg} — resuming normal control.")
+            return
+
         self.state                = EmergencyState.RECOVERY
         self._rec_ticks           = RECOVERY_TICKS
         self._rec_arm_idx         = 0
